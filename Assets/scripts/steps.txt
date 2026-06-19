@@ -1,0 +1,69 @@
+# Complete Pipeline Reference — From Photos to Unity
+
+## Step 1: Take Photos
+- Take **30-50 photos** of your object/room
+- Walk around slowly, lots of overlap between shots
+- Sharp focus, no motion blur
+- Save all photos to:
+```
+C:\Users\Arni\UnityProjects\TestCapture\images\
+```
+(clear out old images first if starting fresh)
+
+---
+
+## Step 2: Clear old COLMAP data (if reusing the folder)
+```cmd
+del C:\Users\Arni\UnityProjects\TestCapture\database.db
+rmdir /s /q C:\Users\Arni\UnityProjects\TestCapture\sparse
+rmdir /s /q C:\Users\Arni\UnityProjects\TestCapture\output
+mkdir C:\Users\Arni\UnityProjects\TestCapture\sparse
+mkdir C:\Users\Arni\UnityProjects\TestCapture\output
+```
+
+---
+
+## Step 3: Run COLMAP (3 commands in order)
+
+**Feature extraction:**
+```cmd
+C:\Users\Arni\COLMAP\bin\colmap.exe feature_extractor --database_path C:\Users\Arni\UnityProjects\TestCapture\database.db --image_path C:\Users\Arni\UnityProjects\TestCapture\images --ImageReader.single_camera 1
+```
+
+**Feature matching:**
+```cmd
+C:\Users\Arni\COLMAP\bin\colmap.exe exhaustive_matcher --database_path C:\Users\Arni\UnityProjects\TestCapture\database.db
+```
+
+**Sparse reconstruction:**
+```cmd
+C:\Users\Arni\COLMAP\bin\colmap.exe mapper --database_path C:\Users\Arni\UnityProjects\TestCapture\database.db --image_path C:\Users\Arni\UnityProjects\TestCapture\images --output_path C:\Users\Arni\UnityProjects\TestCapture\sparse
+```
+
+---
+
+## Step 4: Train Gaussian Splat
+```cmd
+cd C:\Users\Arni\UnityProjects
+venv\Scripts\activate
+python train_gsplat.py
+```
+
+Wait 10-20 minutes. Output will appear at:
+```
+C:\Users\Arni\UnityProjects\TestCapture\output\ply\point_cloud_6999.ply
+```
+
+---
+
+## Step 5: Load into Unity
+1. Open Unity → **GaussianExample** project
+2. **Tools → Gaussian Splats → Create GaussianSplatAsset**
+3. Point **Input PLY** to `point_cloud_6999.ply`
+4. Set **Output Folder** to `Assets/SplatAssets`
+5. Click **Create Asset**
+6. Click **GaussianSplats** in Hierarchy → drag new asset into **Asset** field
+7. Press **Play** → navigate with right-click + WASD
+
+---
+
