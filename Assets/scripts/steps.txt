@@ -1,3 +1,119 @@
+---
+
+# Updated Complete Pipeline Reference
+
+## Step 1: Take Photos
+- 30-100 photos, walk slowly around the object/room
+- Large overlap between shots (60-80%)
+- Sharp focus, no motion blur
+- **Transfer via USB or Google Drive — NOT WhatsApp** (WhatsApp compresses too much)
+- Save to: `C:\Users\Arni\UnityProjects\TestCapture\images\`
+- Clear old images first if reusing the folder
+
+---
+
+## Step 2: Clear old COLMAP data
+```cmd
+del C:\Users\Arni\UnityProjects\TestCapture\database.db
+rmdir /s /q C:\Users\Arni\UnityProjects\TestCapture\sparse
+rmdir /s /q C:\Users\Arni\UnityProjects\TestCapture\output
+mkdir C:\Users\Arni\UnityProjects\TestCapture\sparse
+mkdir C:\Users\Arni\UnityProjects\TestCapture\output
+```
+
+---
+
+## Step 3: Run COLMAP
+```cmd
+C:\Users\Arni\COLMAP\bin\colmap.exe feature_extractor --database_path C:\Users\Arni\UnityProjects\TestCapture\database.db --image_path C:\Users\Arni\UnityProjects\TestCapture\images --ImageReader.single_camera 1
+
+C:\Users\Arni\COLMAP\bin\colmap.exe exhaustive_matcher --database_path C:\Users\Arni\UnityProjects\TestCapture\database.db
+
+C:\Users\Arni\COLMAP\bin\colmap.exe mapper --database_path C:\Users\Arni\UnityProjects\TestCapture\database.db --image_path C:\Users\Arni\UnityProjects\TestCapture\images --output_path C:\Users\Arni\UnityProjects\TestCapture\sparse
+```
+
+**Check reconstruction quality** — look for this line in the mapper output:
+```
+Registering image #X (num_reg_frames=Y)
+```
+If `Y` at the end is close to your total image count, quality is good. If `Y` is much less than total images (like 7 out of 96), reconstruction failed — retake photos.
+
+---
+
+## Step 4: Train Gaussian Splat
+```cmd
+cd C:\Users\Arni\UnityProjects\gsplat
+venv\Scripts\activate
+python examples\simple_trainer.py default --data_dir C:\Users\Arni\UnityProjects\TestCapture --data_factor 1 --result_dir C:\Users\Arni\UnityProjects\TestCapture\output --max_steps 7000 --save_ply
+```
+
+Wait 10-15 minutes. Output at:
+```
+C:\Users\Arni\UnityProjects\TestCapture\output\ply\point_cloud_6999.ply
+```
+
+**Note:** `cd C:\Users\Arni\UnityProjects\gsplat` not `UnityProjects` — this changed from earlier.
+
+---
+
+## Step 5: Load into Unity
+1. Open Unity → **GaussianExample** project (at `C:\Users\Arni\UnityGaussianSplatting-main\projects\GaussianExample`)
+2. **Tools → Gaussian Splats → Create GaussianSplatAsset**
+3. Point **Input PLY** to `point_cloud_6999.ply`
+4. Set **Output Folder** to `Assets/SplatAssets`
+5. Click **Create Asset**
+6. Click **GaussianSplats** in Hierarchy → drag new asset into **Asset** field
+7. Press **Play** → right-click + WASD to navigate
+
+---
+
+# Package Version Lock — DO NOT upgrade these
+
+Save this as a reference. These specific versions work together — upgrading any of them will break things:
+
+| Package | Locked Version | Why |
+|---|---|---|
+| `torch` | `2.4.0+cu124` | Must match CUDA 12.4 exactly |
+| `torchvision` | `0.19.0+cu124` | Must match torch 2.4.0 |
+| `numpy` | `<2.0` (use 1.26.4) | numpy 2.x breaks pycolmap and torch |
+| `gsplat` | already installed via whl | don't reinstall from source |
+| `ultralytics` | current | ignore the torch 2.4.0 warning, it works |
+| CUDA Toolkit | 12.4 | matches torch+cu124 |
+| Python | 3.10 | gsplat wheel is compiled for cp310 |
+
+**The one thing that will silently break everything:** any `pip install` that doesn't pin torch will pull in a CPU-only torch. If CUDA stops working, always run:
+```cmd
+pip install torch==2.4.0+cu124 torchvision==0.19.0+cu124 --index-url https://download.pytorch.org/whl/cu124 --force-reinstall
+pip install "numpy<2.0" --force-reinstall
+```
+
+**Quick sanity check** — run this any time you suspect something broke:
+```cmd
+python -c "import torch; print('CUDA:', torch.cuda.is_available()); print('torch:', torch.__version__); import numpy; print('numpy:', numpy.__version__)"
+```
+Should print `CUDA: True`, `torch: 2.4.0+cu124`, `numpy: 1.26.4`.
+
+---
+
+Once you have good photos, the pipeline from Step 1 to Step 5 should work cleanly. Ready to continue Phase 4 wiring in Unity whenever you have the new dataset — or we can work on Phase 4 Unity side now using the old working splat from June 17.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # Complete Pipeline Reference — From Photos to Unity
 
 ## Step 1: Take Photos
@@ -66,4 +182,3 @@ C:\Users\Arni\UnityProjects\TestCapture\output\ply\point_cloud_6999.ply
 7. Press **Play** → navigate with right-click + WASD
 
 ---
-
