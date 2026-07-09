@@ -555,7 +555,7 @@ GameObject:
   - component: {fileID: 884409252}
   - component: {fileID: 884409251}
   m_Layer: 0
-  m_Name: PhysicsObjectLoader
+  m_Name: ObjectSpawner
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
@@ -573,11 +573,15 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 2fd16c905b51a63419ffe26b66a41cb4, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  jsonPath: C:\Users\Arni\UnityProjects\TestCapture\segmentation\objects_3d.json
-  meshFolder: C:\Users\Arni\UnityProjects\TestCapture\segmentation\meshes
-  splatTransform: {fileID: 1609192435}
-  showDebugBoxes: 1
+  jsonPath: C:\Users\Arni\UnityProjects\video_Capture\segmentation\objects_3d.json
+  showDebugVisuals: 1
   pushForce: 8
+  classFilter: chair
+  minConfidence: 1
+  splatTransform: {fileID: 1609192435}
+  flipX: 0
+  flipY: 0
+  flipZ: 0
 --- !u!4 &884409252
 Transform:
   m_ObjectHideFlags: 0
@@ -726,6 +730,54 @@ CanvasRenderer:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1022004362}
   m_CullTransparentMesh: 1
+--- !u!1 &1067459392
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1067459394}
+  - component: {fileID: 1067459393}
+  m_Layer: 0
+  m_Name: RoomColliderBuilder
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &1067459393
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1067459392}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 310bac76797d405458fd35815c43db92, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  splatTransform: {fileID: 1609192435}
+  boundsMin: {x: -4.881, y: -2.84, z: -1.365}
+  boundsMax: {x: 4.655, y: 2.466, z: 3.566}
+  wallThickness: 0.1
+--- !u!4 &1067459394
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1067459392}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -0.16730909, y: -0.0000486332, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &1095051956
 GameObject:
   m_ObjectHideFlags: 0
@@ -1156,13 +1208,13 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1462254335}
   serializedVersion: 2
-  m_LocalRotation: {x: -0.039000556, y: -0.42679158, z: 0.0026308782, w: -0.90350485}
-  m_LocalPosition: {x: -3.0026817, y: -0.82006466, z: -2.501085}
+  m_LocalRotation: {x: 0.7071068, y: 0, z: 0, w: 0.7071068}
+  m_LocalPosition: {x: 0, y: 2.87, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}
-  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+  m_LocalEulerAnglesHint: {x: 90, y: 0, z: 0}
 --- !u!114 &1462254339
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1209,7 +1261,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &1465932455
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1293,13 +1345,13 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1609192433}
   serializedVersion: 2
-  m_LocalRotation: {x: -0.99254614, y: 0, z: 0, w: 0.12186937}
+  m_LocalRotation: {x: -0.7071068, y: 0, z: 0, w: 0.7071068}
   m_LocalPosition: {x: 0, y: 0, z: 0}
   m_LocalScale: {x: 1, y: 1, z: -1}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}
-  m_LocalEulerAnglesHint: {x: -166, y: 0, z: 0}
+  m_LocalEulerAnglesHint: {x: -90, y: 0, z: 0}
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
@@ -1312,3 +1364,4 @@ SceneRoots:
   - {fileID: 1465932456}
   - {fileID: 884409252}
   - {fileID: 1104222433}
+  - {fileID: 1067459394}

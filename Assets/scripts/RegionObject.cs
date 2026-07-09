@@ -4,22 +4,28 @@ public class RegionObject : MonoBehaviour
 {
     public RegionData data;
 
-    private Renderer rend;
+    [Tooltip("Assigned by the spawner. If left empty, falls back to searching children.")]
+    public Renderer visualRenderer;
+
     private Color originalColor;
-    private bool isHighlighted = false;
 
     void Start()
     {
-        rend = GetComponent<Renderer>();
-        if (rend != null)
-            originalColor = rend.material.color;
+        if (visualRenderer == null)
+            visualRenderer = GetComponentInChildren<Renderer>();
+
+        if (visualRenderer != null)
+            originalColor = visualRenderer.material.color;
     }
 
     public void Select()
     {
-        isHighlighted = true;
-        if (rend != null && data != null)
-            rend.material.color = data.highlightColor;
+        if (visualRenderer != null && data != null)
+        {
+            Color c = data.highlightColor;
+            c.a = 0.8f;
+            visualRenderer.material.color = c;
+        }
 
         InspectionManager.Instance.ShowRegion(data);
         Debug.Log("Selected: " + (data != null ? data.regionName : "Unknown"));
@@ -27,8 +33,7 @@ public class RegionObject : MonoBehaviour
 
     public void Deselect()
     {
-        isHighlighted = false;
-        if (rend != null)
-            rend.material.color = originalColor;
+        if (visualRenderer != null)
+            visualRenderer.material.color = originalColor;
     }
 }
