@@ -1228,7 +1228,10 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   moveSpeed: 5
+  fastMultiplier: 3
   lookSpeed: 2
+  splatTransform: {fileID: 0}
+  startHeightAboveCenter: 2
 --- !u!114 &1462254340
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1261,7 +1264,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!114 &1465932455
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1322,7 +1325,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c12d929a7f62c48adbe9ff45c9a33ff0, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  m_Asset: {fileID: 11400000, guid: 4617804178380c64cb39c0df165aef8a, type: 2}
+  m_Asset: {fileID: 11400000, guid: 2c5b9789ecd333c4eba2dd5b4a874aad, type: 2}
   m_RenderOrder: 0
   m_SplatScale: 1
   m_OpacityScale: 1
