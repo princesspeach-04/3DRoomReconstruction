@@ -26,12 +26,13 @@ public class SceneObjectSpawner : MonoBehaviour
 {
     [Header("Settings")]
     public string jsonPath = @"C:\Users\Arni\UnityProjects\video_Capture\segmentation\objects_3d.json";
-    public bool showDebugVisuals = true;
-    public float pushForce = 8f;
+    public bool showDebugVisuals = true; // kept for cases where mesh_file fails to load -- see fallback below
 
     [Header("Filtering (leave classFilter empty to spawn everything)")]
     public string classFilter = "chair";
-    public float minConfidence = 1f;
+    public float minConfidence = 0f; // build_object_meshes.py's confidence is a GLOBAL average across
+                                     // frames, not a real per-instance score -- don't set this too
+                                     // strict, it won't discriminate between clusters meaningfully.
 
     [Header("Transform to match splat")]
     [Tooltip("The GameObject rendering the Gaussian Splat. Objects are parented under this so position/rotation/scale all line up automatically -- do not hand-flip any axes.")]
@@ -103,59 +104,96 @@ public class SceneObjectSpawner : MonoBehaviour
         go.transform.localRotation = Quaternion.identity;
         go.transform.localScale = Vector3.one;
 
-        Vector3 size = new Vector3(
-            Mathf.Max(obj.size[0], 0.05f),
-            Mathf.Max(obj.size[1], 0.05f),
-            Mathf.Max(obj.size[2], 0.05f)
-        );
+        Color classColor = classColors.ContainsKey(obj.@class) ? classColors[obj.@class] : Color.gray;
 
-        BoxCollider col = go.AddComponent<BoxCollider>();
-        col.size = size;
+        // ---- Try to load the real chair-shaped mesh (mesh_file, from
+        // build_object_meshes.py -- Open3D alpha-shape reconstruction,
+        // object-local i.e. already centered on its own origin, which is
+        // why "position" above is applied separately via transform). ----
+        bool loadedMesh = false;
+        if (!string.IsNullOrEmpty(obj.mesh_file) && File.Exists(obj.mesh_file))
+        {
+            Mesh mesh = RuntimeObjImporter.LoadOBJ(obj.mesh_file);
+            if (mesh != null && mesh.vertexCount > 0)
+            {
+                var mf = go.AddComponent<MeshFilter>();
+                mf.mesh = mesh;
+                var mr = go.AddComponent<MeshRenderer>();
+                var mat = new Material(Shader.Find("Standard"));
+                mat.color = classColor;
+                mr.material = mat;
 
-        Rigidbody rb = go.AddComponent<Rigidbody>();
-        rb.mass = obj.mass > 0 ? obj.mass : 1f;
-        rb.drag = obj.drag;
-        rb.useGravity = true;
+                // Non-convex, NO Rigidbody: this is the whole point of
+                // switching away from ObjectPusher -- a convex hull would
+                // erase the gaps between chair legs/under the seat that
+                // the alpha-shape reconstruction exists to capture.
+                // DraggableObject moves the transform directly, so
+                // convexity is never required.
+                var mc = go.AddComponent<MeshCollider>();
+                mc.sharedMesh = mesh;
+                mc.convex = false;
 
-        ObjectPusher pusher = go.AddComponent<ObjectPusher>();
-        pusher.pushForce = pushForce;
+                RegionObject region0 = go.AddComponent<RegionObject>();
+                region0.visualRenderer = mr;
+                AttachRegionData(region0, obj, classColor);
 
-        RegionObject region = go.AddComponent<RegionObject>();
+                go.AddComponent<DraggableObject>();
+                loadedMesh = true;
+            }
+            else
+            {
+                Debug.LogWarning($"mesh_file for {obj.id} loaded but had 0 vertices, "
+                                  + $"falling back to box: {obj.mesh_file}");
+            }
+        }
+        else if (!string.IsNullOrEmpty(obj.mesh_file))
+        {
+            Debug.LogWarning($"mesh_file not found for {obj.id}: {obj.mesh_file}, falling back to box");
+        }
+
+        // ---- Fallback: old box-collider debug-cube path, only used if
+        // mesh_file is missing/failed to load, so a bad mesh reconstruction
+        // doesn't silently drop the object from the scene entirely. ----
+        if (!loadedMesh && showDebugVisuals)
+        {
+            Vector3 size = new Vector3(
+                Mathf.Max(obj.size[0], 0.05f),
+                Mathf.Max(obj.size[1], 0.05f),
+                Mathf.Max(obj.size[2], 0.05f));
+
+            BoxCollider col = go.AddComponent<BoxCollider>();
+            col.size = size;
+
+            GameObject visual = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            visual.transform.SetParent(go.transform, false);
+            visual.transform.localScale = size;
+            Destroy(visual.GetComponent<BoxCollider>());
+            var mat = new Material(Shader.Find("Standard"));
+            Color c = classColor; c.a = 0.5f;
+            mat.color = c;
+            visual.GetComponent<Renderer>().material = mat;
+
+            RegionObject region1 = go.AddComponent<RegionObject>();
+            region1.visualRenderer = visual.GetComponent<Renderer>();
+            AttachRegionData(region1, obj, classColor);
+
+            go.AddComponent<DraggableObject>();
+        }
+
+        go.layer = 6; // Selectable -- same layer SelectionRaycaster already filters on
+
+        Debug.Log($"Spawned {obj.id} ({obj.@class}, conf {obj.confidence:F2}, "
+                  + $"mesh={(loadedMesh ? "yes" : "fallback box")}) at {go.transform.localPosition}");
+    }
+
+    void AttachRegionData(RegionObject region, DetectedObjectData obj, Color color)
+    {
         RegionData regionData = ScriptableObject.CreateInstance<RegionData>();
         regionData.regionName = FormatClassName(obj.@class) + " " + obj.id.Split('_')[1];
         regionData.description = $"Detected {obj.@class} - {obj.point_count} pts, confidence {obj.confidence:F2}";
         regionData.tags = new string[] { obj.@class, "auto-detected" };
-        regionData.highlightColor = classColors.ContainsKey(obj.@class) ? classColors[obj.@class] : Color.gray;
+        regionData.highlightColor = color;
         region.data = regionData;
-
-        if (showDebugVisuals)
-        {
-            GameObject visual = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            visual.transform.SetParent(go.transform, false);
-            visual.transform.localPosition = Vector3.zero;
-            visual.transform.localScale = size;
-            Destroy(visual.GetComponent<BoxCollider>());
-
-            Material mat = new Material(Shader.Find("Standard"));
-            Color c = regionData.highlightColor;
-            c.a = 0.5f;
-            mat.color = c;
-            mat.SetFloat("_Mode", 3);
-            mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
-            mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
-            mat.SetInt("_ZWrite", 0);
-            mat.DisableKeyword("_ALPHATEST_ON");
-            mat.EnableKeyword("_ALPHABLEND_ON");
-            mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
-            mat.renderQueue = 3000;
-            visual.GetComponent<Renderer>().material = mat;
-
-            region.visualRenderer = visual.GetComponent<Renderer>();
-        }
-
-        go.layer = 6; // Selectable
-
-        Debug.Log($"Spawned {obj.id} ({obj.@class}, conf {obj.confidence:F2}) at {go.transform.localPosition}, size {size}");
     }
 
     string FormatClassName(string className)

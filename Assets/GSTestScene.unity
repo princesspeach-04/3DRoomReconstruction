@@ -575,9 +575,8 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   jsonPath: C:\Users\Arni\UnityProjects\video_Capture\segmentation\objects_3d.json
   showDebugVisuals: 1
-  pushForce: 8
   classFilter: chair
-  minConfidence: 1
+  minConfidence: 0
   splatTransform: {fileID: 1609192435}
   flipX: 0
   flipY: 0
@@ -1230,7 +1229,7 @@ MonoBehaviour:
   moveSpeed: 5
   fastMultiplier: 3
   lookSpeed: 2
-  splatTransform: {fileID: 0}
+  splatTransform: {fileID: 1609192435}
   startHeightAboveCenter: 2
 --- !u!114 &1462254340
 MonoBehaviour:
@@ -1325,7 +1324,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c12d929a7f62c48adbe9ff45c9a33ff0, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  m_Asset: {fileID: 11400000, guid: 2c5b9789ecd333c4eba2dd5b4a874aad, type: 2}
+  m_Asset: {fileID: 11400000, guid: 63f75f2cbe437ea47907ddab2f32a788, type: 2}
   m_RenderOrder: 0
   m_SplatScale: 1
   m_OpacityScale: 1
