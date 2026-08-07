@@ -27,10 +27,15 @@ public class DraggableObject : MonoBehaviour
     void Start()
     {
         cam = Camera.main;
+        if (cam == null)
+            Debug.LogError($"[DraggableObject] Camera.main is null on {gameObject.name} -- "
+                            + "check your camera's Tag dropdown is set to 'MainCamera', "
+                            + "not just named 'Main Camera'. Dragging can't work without this.");
     }
 
     void OnMouseDown()
     {
+        Debug.Log($"[DraggableObject] OnMouseDown on {gameObject.name}");
         Vector3 planeNormal = constrainToHorizontalPlane ? Vector3.up : -cam.transform.forward;
         dragPlane = new Plane(planeNormal, transform.position);
 
@@ -40,6 +45,11 @@ public class DraggableObject : MonoBehaviour
             Vector3 hitPoint = ray.GetPoint(dist);
             dragOffset = transform.position - hitPoint;
             dragging = true;
+        }
+        else
+        {
+            Debug.LogWarning($"[DraggableObject] drag plane raycast MISSED on {gameObject.name} "
+                              + "-- camera ray is near-parallel to the plane, drag won't start.");
         }
     }
 
@@ -56,6 +66,7 @@ public class DraggableObject : MonoBehaviour
 
     void OnMouseUp()
     {
+        Debug.Log($"[DraggableObject] OnMouseUp on {gameObject.name}, moved to {transform.position}");
         dragging = false;
     }
 }
