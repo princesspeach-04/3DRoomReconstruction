@@ -192,7 +192,7 @@ public class SceneObjectSpawner : MonoBehaviour
         regionData.regionName = FormatClassName(obj.@class) + " " + obj.id.Split('_')[1];
         regionData.description = $"Detected {obj.@class} - {obj.point_count} pts, confidence {obj.confidence:F2}";
         regionData.tags = new string[] { obj.@class, "auto-detected" };
-        regionData.highlightColor = color;
+        regionData.highlightColor = Color.yellow; // distinct from base material color
         region.data = regionData;
     }
 
