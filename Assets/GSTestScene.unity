@@ -1146,8 +1146,7 @@ Transform:
   m_LocalPosition: {x: -0.033775594, y: -0.0000486306, z: -0.02207474}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
-  m_Children:
-  - {fileID: 1462254338}
+  m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &1462254335
@@ -1162,6 +1161,7 @@ GameObject:
   - component: {fileID: 1462254337}
   - component: {fileID: 1462254336}
   - component: {fileID: 1462254340}
+  - component: {fileID: 1462254341}
   m_Layer: 0
   m_Name: Main Camera
   m_TagString: MainCamera
@@ -1237,11 +1237,11 @@ Transform:
   m_GameObject: {fileID: 1462254335}
   serializedVersion: 2
   m_LocalRotation: {x: 0.7071068, y: -0, z: -0, w: 0.7071068}
-  m_LocalPosition: {x: 0.033775594, y: 2.8700485, z: 0.02207474}
+  m_LocalPosition: {x: 0, y: 2.87, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
-  m_Father: {fileID: 1398223019}
+  m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 90, y: 0, z: 0}
 --- !u!114 &1462254340
 MonoBehaviour:
@@ -1259,6 +1259,23 @@ MonoBehaviour:
   selectableLayer:
     serializedVersion: 2
     m_Bits: 64
+--- !u!114 &1462254341
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1462254335}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: b7ca2f0fecd456348b5786e3bf77a09e, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  moveSpeed: 3
+  fastMultiplier: 3
+  lookSpeed: 2
+  splatTransform: {fileID: 1609192435}
+  startHeightAboveCenter: 2
 --- !u!1 &1465932454
 GameObject:
   m_ObjectHideFlags: 0
@@ -1423,4 +1440,5 @@ SceneRoots:
   - {fileID: 1465932456}
   - {fileID: 884409252}
   - {fileID: 1104222433}
+  - {fileID: 1462254338}
   - {fileID: 1398223019}
