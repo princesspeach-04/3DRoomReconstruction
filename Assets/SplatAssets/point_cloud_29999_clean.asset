@@ -13,12 +13,12 @@ MonoBehaviour:
   m_Name: point_cloud_29999_clean
   m_EditorClassIdentifier: 
   m_FormatVersion: 20231020
-  m_SplatCount: 360008
-  m_BoundsMin: {x: -0.7672058, y: -0.5855366, z: -0.31217188}
-  m_BoundsMax: {x: 0.6924072, y: 0.7054867, z: 0.32609054}
+  m_SplatCount: 356556
+  m_BoundsMin: {x: -0.75988364, y: -0.5852047, z: -0.31503925}
+  m_BoundsMax: {x: 0.69108886, y: 0.716503, z: 0.30904227}
   m_DataHash:
     serializedVersion: 2
-    Hash: 5932c75f6077cf156e0bf5ce0c044652
+    Hash: 914bd542cdd6fc649dfc3cce0bb9f4dc
   m_PosFormat: 1
   m_ScaleFormat: 1
   m_SHFormat: 2

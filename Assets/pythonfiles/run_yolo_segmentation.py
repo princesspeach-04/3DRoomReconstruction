@@ -1,12 +1,8 @@
 """
 run_yolo_segmentation.py
 
-Replaces run_yolo_detection.py. Instead of bounding boxes, this runs
-YOLOv8-SEG and saves a per-instance PIXEL MASK for every detection.
-Boxes only ever gave you a rectangular blob of 3D points when
-backprojected -- that's the "box dropping from somewhere" problem.
-Masks let build_object_meshes.py keep only the points that actually
-lie on the object's silhouette in each frame.
+Runs YOLOv8-SEG and saves a per-instance PIXEL MASK for every detection,
+across every class you care about (not just chair anymore).
 
 Output:
   segmentation/detections_seg.json
@@ -17,7 +13,8 @@ Output:
       shape (height, width), True where that instance covers the pixel
 
 Usage:
-    python run_yolo_segmentation.py --base-dir <capture_dir> --classes chair
+    python run_yolo_segmentation.py --base-dir <capture_dir>
+    python run_yolo_segmentation.py --base-dir <capture_dir> --classes chair table
 """
 import os
 import json
@@ -30,15 +27,29 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--base-dir", required=True,
                      help="MUST match whatever run_pipeline.py used for this capture.")
 parser.add_argument("--weights", default="yolov8n-seg.pt",
-                     help="Segmentation weights -- NOT the plain yolov8n.pt "
-                          "used by the old box-based script. Auto-downloads "
-                          "if not found locally.")
+                     help="Segmentation weights. Auto-downloads if not found locally.")
 parser.add_argument("--conf", type=float, default=0.25)
-parser.add_argument("--classes", nargs="+", default=["chair"],
-                     help="Only keep these COCO classes -- filters noise and "
-                          "keeps mask storage small. Add more later once "
-                          "the chair-only pipeline is validated end to end.")
+parser.add_argument("--classes", nargs="+",
+                     default=["chair", "table", "laptop", "phone", "bottle", "cup", "bag"],
+                     help="Only keep these COCO classes -- filters noise and keeps "
+                          "mask storage small. Add/remove classes as your scenes need.")
 args = parser.parse_args()
+
+# COCO's real class names differ from the friendly names used downstream
+# (Unity colours, classify_treatment.py, --classes). Without this map the
+# classes "table", "phone" and "bag" can NEVER match anything YOLO outputs
+# ("dining table", "cell phone", "handbag"...). Friendly name -> COCO names.
+ALIASES = {
+    "table": ["dining table"],
+    "phone": ["cell phone"],
+    "bag":   ["handbag", "backpack", "suitcase"],
+    "tv":    ["tv"],
+    "couch": ["couch"],
+}
+coco_to_friendly = {}
+for friendly in args.classes:
+    for coco in ALIASES.get(friendly, [friendly]):
+        coco_to_friendly[coco] = friendly
 
 BASE_DIR = args.base_dir
 IMAGES_DIR = os.path.join(BASE_DIR, "images")
@@ -57,10 +68,11 @@ assert len(image_files) > 0, f"No images found in {IMAGES_DIR}"
 print(f"Found {len(image_files)} images, filtering to classes: {args.classes}")
 
 model = YOLO(args.weights)
-class_filter = set(args.classes)
+class_filter = set(coco_to_friendly.keys())
 
 detections = {}
 total_instances = 0
+per_class_counts = {c: 0 for c in args.classes}
 
 for i, fname in enumerate(image_files):
     fpath = os.path.join(IMAGES_DIR, fname)
@@ -72,15 +84,12 @@ for i, fname in enumerate(image_files):
         if r.masks is None:
             continue
         img_h, img_w = r.orig_shape
-        # r.masks.data: (N, mask_h, mask_w) -- often a different (lower)
-        # resolution than the source image, so resize each mask back up
-        # to the ORIGINAL frame resolution before saving. Getting this
-        # wrong silently misaligns every downstream pixel test.
         raw_masks = r.masks.data.cpu().numpy()
         for j, box in enumerate(r.boxes):
-            cls_name = model.names[int(box.cls)]
-            if cls_name not in class_filter:
+            coco_name = model.names[int(box.cls)]
+            if coco_name not in class_filter:
                 continue
+            cls_name = coco_to_friendly[coco_name]  # stored under the friendly name
             conf = float(box.conf)
             mask = raw_masks[j]
             if mask.shape != (img_h, img_w):
@@ -90,6 +99,7 @@ for i, fname in enumerate(image_files):
             key = f"mask_{len(entries)}"
             mask_arrays[key] = mask_bool
             entries.append({"class": cls_name, "confidence": conf, "mask_key": key})
+            per_class_counts[cls_name] = per_class_counts.get(cls_name, 0) + 1
 
     if entries:
         stem = os.path.splitext(fname)[0]
@@ -103,8 +113,8 @@ for i, fname in enumerate(image_files):
 
 assert total_instances > 0, (
     f"Zero instances of {args.classes} found across every image. Either "
-    f"--conf is too high, the class name doesn't match COCO's exact "
-    f"naming, or the scene genuinely doesn't contain the target object."
+    f"--conf is too high, class names don't match COCO's exact naming, "
+    f"or the scene genuinely doesn't contain any target objects."
 )
 
 os.makedirs(os.path.dirname(OUT_FILE), exist_ok=True)
@@ -114,3 +124,6 @@ with open(OUT_FILE, "w") as f:
 print(f"\nSaved {total_instances} instance masks across {len(image_files)} images to:")
 print(f"  {OUT_FILE}")
 print(f"  {MASKS_DIR}/")
+print("\nPer-class instance counts:")
+for cls, count in sorted(per_class_counts.items(), key=lambda x: -x[1]):
+    print(f"  {cls}: {count}")

@@ -1,3 +1,27 @@
+
+cd C:\Users\Arni\UnityProjects
+venv\Scripts\activate
+
+(venv) C:\Users\Arni\UnityProjects>
+
+set VIDEO=C:\Users\Arni\UnityProjects\video.mp4
+set BASE_DIR=C:\Users\Arni\UnityProjects\video_Capture
+
+python run_pipeline.py --video %VIDEO% --base-dir %BASE_DIR%
+python compute_transform.py --base-dir %BASE_DIR%
+python clean_gaussians.py --base-dir %BASE_DIR% --max-steps 30000 --min-view-count 3 --view-check-stride 2 --keep-largest-cluster
+python run_yolo_segmentation.py --base-dir %BASE_DIR%
+python check.py --base-dir %BASE_DIR% --max-steps 30000
+python build_object_meshes.py --base-dir %BASE_DIR% --max-steps 30000 --dbscan-eps 0.05 --min-cluster-size 500
+python build_collider_voxel.py --capture-dir %BASE_DIR% --out "C:\Users\Arni\UnityProjects\video_Capture\output\room_mesh.obj"
+
+
+
+
+
+
+
+
 # Aerosense Pipeline Reference (current)
 
 This replaces earlier notes that had you running COLMAP manually
