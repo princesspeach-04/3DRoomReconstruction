@@ -4,16 +4,18 @@ using System.IO;
 using UnityEngine;
 
 // Loads a .obj file into a Unity Mesh AT RUNTIME (no editor import step --
-// required because a built PC app can't use AssetDatabase). Handles the
-// plain vertex/normal/triangle-face output Open3D's write_triangle_mesh
-// produces. Does not handle textures/materials -- these are collider/
-// shape meshes, not rendered assets, so a flat material is enough.
+// required because a built PC app can't use AssetDatabase).
+// Supports: "v x y z", "v x y z r g b" (vertex colours, 0-1 floats, as written by
+// generate_replacement.py), "vn", and faces with 3+ vertices (fan-triangulated).
+// No textures/materials: collider meshes use a flat material, replacement
+// meshes use the vertex-colour shader (Aerosense/VertexColorLit).
 public static class RuntimeObjImporter
 {
     public static Mesh LoadOBJ(string path)
     {
         var vertices = new List<Vector3>();
         var normals = new List<Vector3>();
+        var colors = new List<Color>();
         var triangles = new List<int>();
         bool hasNormals = false;
 
@@ -27,6 +29,9 @@ public static class RuntimeObjImporter
             {
                 vertices.Add(new Vector3(
                     ParseFloat(parts[1]), ParseFloat(parts[2]), ParseFloat(parts[3])));
+                if (parts.Length >= 7)
+                    colors.Add(new Color(
+                        ParseFloat(parts[4]), ParseFloat(parts[5]), ParseFloat(parts[6]), 1f));
             }
             else if (parts[0] == "vn" && parts.Length >= 4)
             {
@@ -36,15 +41,18 @@ public static class RuntimeObjImporter
             }
             else if (parts[0] == "f" && parts.Length >= 4)
             {
-                // Open3D writes triangulated faces already ("f v1 v2 v3"
-                // or "f v1//n1 v2//n2 v3//n3") -- if you ever feed this a
-                // quad-faced OBJ from elsewhere, add a fan-triangulation
-                // loop here instead of the direct 3-index parse below.
-                for (int i = 1; i <= 3; i++)
+                int n = vertices.Count;
+                var idx = new List<int>(parts.Length - 1);
+                for (int i = 1; i < parts.Length; i++)
                 {
-                    string token = parts[i].Split('/')[0];
-                    int idx = int.Parse(token, CultureInfo.InvariantCulture) - 1; // OBJ is 1-indexed
-                    triangles.Add(idx);
+                    int k = int.Parse(parts[i].Split('/')[0], CultureInfo.InvariantCulture);
+                    idx.Add(k > 0 ? k - 1 : n + k); // OBJ is 1-indexed, negatives are relative
+                }
+                for (int i = 1; i < idx.Count - 1; i++)
+                {
+                    triangles.Add(idx[0]);
+                    triangles.Add(idx[i]);
+                    triangles.Add(idx[i + 1]);
                 }
             }
         }
@@ -55,6 +63,8 @@ public static class RuntimeObjImporter
             : UnityEngine.Rendering.IndexFormat.UInt16;
         mesh.SetVertices(vertices);
         mesh.SetTriangles(triangles, 0);
+        if (colors.Count == vertices.Count)
+            mesh.SetColors(colors);
         if (hasNormals && normals.Count == vertices.Count)
             mesh.SetNormals(normals);
         else
