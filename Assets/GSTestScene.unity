@@ -577,7 +577,7 @@ MonoBehaviour:
   showDebugVisuals: 1
   classFilter: 
   onlyReplacements: 1
-  highlightReplacements: 0
+  highlightReplacements: 1
   highlightColor: {r: 1, g: 0.45, b: 0, a: 1}
   minConfidence: 0
   splatTransform: {fileID: 1609192435}

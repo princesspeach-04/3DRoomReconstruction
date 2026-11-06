@@ -62,7 +62,7 @@ from scipy.sparse.csgraph import connected_components
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from colmap_io import read_images_binary, read_cameras_binary, qvec_to_rotmat
 
-VERSION = "v5 (multi-view pose, mask-fitted scale, numpy colour sampling)"
+VERSION = "v8 (YOLO masks drive crops, containment test, point masks off by default)"
 GRID = 96            # silhouette comparison grid (longest side, pixels)
 N_SAMPLES = 40000    # surface samples used for projection
 
@@ -682,7 +682,7 @@ def photo_colors(Vw, F, base_colors, view_data, size_ref):
         gy = np.clip((v * ds).astype(np.int64), 0, gh - 1)
         zbuf = np.full((gh, gw), np.inf)
         np.minimum.at(zbuf, (gy[ok], gx[ok]), z[ok])
-        zbuf = ndimage.minimum_filter(zbuf, size=3)
+        zbuf = np.where(np.isinf(zbuf), ndimage.minimum_filter(zbuf, size=3), zbuf)  # fill gaps only
         tol = 0.01 * size_ref + 10.0 * float(np.median(z[ok])) / fx
         visible = ok & (z <= zbuf[gy, gx] + tol)
         # facing the camera
@@ -710,6 +710,244 @@ def photo_colors(Vw, F, base_colors, view_data, size_ref):
 
 
 # ----------------------------------------------------------------------------
+# virtual views: find every frame where the object's own 3D points are fully visible
+# ----------------------------------------------------------------------------
+def load_clean_splats(base):
+    """(xyz, opacity) of the newest *_clean.ply, or (None, None)."""
+    try:
+        from plyfile import PlyData
+        cands = glob.glob(os.path.join(base, "output", "ply", "point_cloud_*_clean.ply"))
+        if not cands:
+            return None, None
+
+        def step(p):
+            m = re.search(r"point_cloud_(\d+)", os.path.basename(p))
+            return int(m.group(1)) if m else -1
+        v = PlyData.read(max(cands, key=step))["vertex"]
+        xyz = np.stack([v["x"], v["y"], v["z"]], 1).astype(np.float32)
+        if "opacity" in v.data.dtype.names:
+            op = 1.0 / (1.0 + np.exp(-np.asarray(v["opacity"], dtype=np.float64)))
+        else:
+            op = np.ones(len(xyz))
+        return xyz, op
+    except Exception as e:
+        print(f"  (could not read the clean PLY: {e})")
+        return None, None
+
+
+def footprint_mask(u, v, W, H, scale=0.5, r=None, upscale=True):
+    """Silhouette of a set of surface points (splat centres) projected at (u, v).
+    Returns (mask, closing radius used). Pass the same r to compare two point sets fairly."""
+    w, h = max(int(W * scale), 8), max(int(H * scale), 8)
+    gx = np.clip((u * scale).astype(np.int64), 0, w - 1)
+    gy = np.clip((v * scale).astype(np.int64), 0, h - 1)
+    m = np.zeros((h, w), np.uint8)
+    m[gy, gx] = 1
+    if r is None:
+        area = float((gx.max() - gx.min() + 1) * (gy.max() - gy.min() + 1))
+        spacing = np.sqrt(max(area, 1.0) / max(len(gx), 1))
+        r = int(np.clip(round(spacing * 1.3), 1, 14))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
+    m = cv2.dilate(m, np.ones((3, 3), np.uint8))
+    m = ndimage.binary_fill_holes(m > 0).astype(np.uint8)
+    if upscale:
+        m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
+    return m > 0, r
+
+
+def compute_virtual_views(objs, poses, xyz, opacity, up, images_dir, args, keep_per_obj=20):
+    """For every object that has a saved point set: scan ALL frames, keep the ones where the object
+    is fully inside the image and mostly unoccluded (first-visible-surface test), build its silhouette
+    from the visible points, and rank by size x sharpness x viewing elevation.
+    Returns {object_id: [candidate dicts, best first]}."""
+    pts = {}
+    for o in objs:
+        pf = o.get("points_file")
+        if pf and os.path.exists(pf):
+            P = np.load(pf).astype(np.float32)
+            if len(P) > 25000:
+                P = P[np.random.default_rng(0).choice(len(P), 25000, replace=False)]
+            pts[o["id"]] = P
+    if not pts or xyz is None:
+        return {}
+    centers = {o["id"]: object_center(o)[3] for o in objs}
+    solid = opacity >= 0.3
+    cand = {oid: [] for oid in pts}
+    names = sorted(poses.keys())
+    for fi, fname in enumerate(names):
+        c2w, cam = poses[fname]
+        w2c = np.linalg.inv(c2w)
+        R = w2c[:3, :3].astype(np.float32)
+        t = w2c[:3, 3].astype(np.float32)
+        W, H = int(cam.width), int(cam.height)
+        pc = xyz @ R.T + t
+        z = pc[:, 2]
+        zs = np.clip(z, 1e-6, None)
+        u = cam.fx * pc[:, 0] / zs + cam.cx
+        v = cam.fy * pc[:, 1] / zs + cam.cy
+        ok = (z > 1e-6) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+        d = 8.0
+        gw, gh = max(int(W / d), 2), max(int(H / d), 2)
+        gx = np.clip((u / d).astype(np.int64), 0, gw - 1)
+        gy = np.clip((v / d).astype(np.int64), 0, gh - 1)
+        sel = ok & solid
+        zb = np.full((gh, gw), np.inf, np.float32)
+        np.minimum.at(zb, (gy[sel], gx[sel]), z[sel])
+        zb = np.where(np.isinf(zb), ndimage.minimum_filter(zb, size=3), zb)
+        for oid, P in pts.items():
+            q = P @ R.T + t
+            zq = q[:, 2]
+            if (zq > 1e-6).mean() < 0.97:
+                continue
+            zqs = np.clip(zq, 1e-6, None)
+            uq = cam.fx * q[:, 0] / zqs + cam.cx
+            vq = cam.fy * q[:, 1] / zqs + cam.cy
+            m = 4.0
+            inside = (zq > 1e-6) & (uq >= m) & (uq < W - m) & (vq >= m) & (vq < H - m)
+            if inside.mean() < 0.97:
+                continue
+            qx = np.clip((uq / d).astype(np.int64), 0, gw - 1)
+            qy = np.clip((vq / d).astype(np.int64), 0, gh - 1)
+            vis = inside & (zq <= zb[qy, qx] + 0.03 + 0.02 * zq)
+            if vis.sum() < 60:
+                continue
+            # Occlusion by OTHER things = the visible silhouette is smaller than the full one.
+            # (The object's own hidden back side projects inside its front silhouette, so it
+            #  must not count against the view.)
+            sc_ = 0.25
+            m_full, r_ = footprint_mask(uq[inside], vq[inside], W, H, scale=sc_, upscale=False)
+            m_vis, _ = footprint_mask(uq[vis], vq[vis], W, H, scale=sc_, r=r_, upscale=False)
+            frac_vis = float(m_vis.sum() / max(m_full.sum(), 1))
+            if frac_vis < 0.85:
+                continue
+            ys0, xs0 = vq[vis], uq[vis]
+            side = min(xs0.max() - xs0.min(), ys0.max() - ys0.min())
+            if side < args.min_mask_px:
+                continue
+            cam_pos = c2w[:3, 3]
+            dvec = cam_pos - centers[oid]
+            elev = float(np.degrees(np.arcsin(np.clip(dvec @ up / max(np.linalg.norm(dvec), 1e-9), -1, 1))))
+            area_est = float((xs0.max() - xs0.min()) * (ys0.max() - ys0.min()))
+            ew = 1.0 if 8.0 <= elev <= 65.0 else 0.7
+            pre = np.sqrt(area_est) * frac_vis * ew
+            cand[oid].append({"frame": fname, "uv": (xs0.astype(np.float32), ys0.astype(np.float32)),
+                              "WH": (W, H), "pre": pre, "frac_vis": frac_vis, "elev": elev, "ew": ew,
+                              "cam_pos": cam_pos.copy()})
+            if len(cand[oid]) > keep_per_obj:
+                cand[oid].sort(key=lambda c: -c["pre"])
+                del cand[oid][keep_per_obj:]
+        if (fi + 1) % 100 == 0 or fi == len(names) - 1:
+            print(f"  scanned {fi + 1}/{len(names)} frames for object visibility")
+    out = {}
+    for oid, lst in cand.items():
+        lst.sort(key=lambda c: -c["pre"])
+        for c in lst:
+            gray = cv2.imread(os.path.join(images_dir, c["frame"]), cv2.IMREAD_GRAYSCALE)
+            c["mask"], _ = footprint_mask(c["uv"][0], c["uv"][1], *c["WH"])
+            if gray is None:
+                c["score"] = 0.0
+                continue
+            mk = c["mask"]
+            if mk.shape != gray.shape:
+                mk = cv2.resize(mk.astype(np.uint8), (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
+                c["mask"] = mk
+            lap = cv2.Laplacian(gray, cv2.CV_32F)
+            sharp = float(lap[mk].var()) if mk.any() else 0.0
+            c["score"] = float(np.sqrt(mk.sum()) * np.log1p(sharp) * c["frac_vis"] * c["ew"])
+        lst.sort(key=lambda c: -c["score"])
+        out[oid] = lst
+    return out
+
+
+def pick_spread(cands, center_world, k, min_sep_deg=12.0):
+    chosen = []
+    for c in cands:
+        d = c["cam_pos"] - center_world
+        d = d / max(np.linalg.norm(d), 1e-9)
+        if all(np.degrees(np.arccos(np.clip(d @ ((o["cam_pos"] - center_world) /
+               max(np.linalg.norm(o["cam_pos"] - center_world), 1e-9)), -1, 1))) >= min_sep_deg for o in chosen):
+            chosen.append(c)
+        if len(chosen) >= k:
+            break
+    return chosen
+
+
+def mask_iou(a, b):
+    return float((a & b).sum() / max((a | b).sum(), 1))
+
+
+def load_view(frame, mask, poses, images_dir, detections, cls, masks_dir, center_world=None,
+              allow_point_masks=False, min_contain=0.6):
+    """Image + mask for one view.
+
+    The point-based silhouette `mask` comes from the object's 3D cluster. Clusters are often
+    INFLATED (they swallow floor / neighbours), so that silhouette is only used as a rough
+    search region: a YOLO mask of the same class is adopted when most of it lies INSIDE the
+    silhouette (containment, not IoU - an inflated silhouette has a low IoU with the true
+    object but still contains it). If several YOLO instances qualify, the one whose centre is
+    closest to the projected object centre wins.
+    Without a YOLO mask the view is dropped (returns None) unless allow_point_masks is set."""
+    im = cv2.imread(os.path.join(images_dir, frame))
+    if im is None:
+        return None
+    if mask is not None and mask.shape != im.shape[:2]:
+        mask = cv2.resize(mask.astype(np.uint8), (im.shape[1], im.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
+    c2w, cam = poses[frame]
+    used, chosen = "points", None
+    npz = os.path.join(masks_dir, os.path.splitext(frame)[0] + ".npz")
+    if mask is not None and os.path.exists(npz):
+        data = np.load(npz)
+        pu = pv = None
+        if center_world is not None:
+            w2c = np.linalg.inv(c2w)
+            pc = w2c[:3, :3] @ center_world + w2c[:3, 3]
+            if pc[2] > 1e-6:
+                pu = (cam.fx * pc[0] / pc[2] + cam.cx) * im.shape[1] / cam.width
+                pv = (cam.fy * pc[1] / pc[2] + cam.cy) * im.shape[0] / cam.height
+        best, bd = None, 1e18
+        for e in detections.get(frame, []):
+            if e["class"] != cls:
+                continue
+            ym = data[e["mask_key"]].astype(bool)
+            if ym.shape != mask.shape:
+                ym = cv2.resize(ym.astype(np.uint8), (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
+            n = int(ym.sum())
+            if n < 50:
+                continue
+            if float((ym & mask).sum()) / n < min_contain:
+                continue
+            ys, xs = np.nonzero(ym)
+            d = 0.0 if pu is None else float(np.hypot(xs.mean() - pu, ys.mean() - pv))
+            if d < bd:
+                best, bd = ym, d
+        if best is not None:
+            chosen, used = best, "yolo"
+    if chosen is None:
+        if not allow_point_masks:
+            return None
+        chosen = mask
+    return {"frame": frame, "img": im, "mask": chosen.astype(bool), "c2w": c2w, "cam": cam, "mask_src": used}
+
+
+def fit_candidate(mpath, size, center_world, vds, up, args, rng):
+    """Load one TripoSR mesh and solve its pose against all views."""
+    V, F, C = read_obj(mpath)
+    if len(V) < 50 or len(F) < 50:
+        raise RuntimeError("generated mesh is empty")
+    V, F, C = keep_main_components(V, F, C)
+    F, _ = fix_winding(V, F)
+    ctr = (V.max(0) + V.min(0)) / 2
+    Vu = (V - ctr) / max((V.max(0) - V.min(0)).max(), 1e-9)
+    P, PC = sample_surface(Vu, F, C, N_SAMPLES, rng)
+    ms = MultiSolver(Vu, P, PC, size, center_world, vds, size_weight=args.size_weight)
+    best = solve_pose(ms, up, args.yaw_step)
+    if best is None or all(o is None for o in best["render"]):
+        raise RuntimeError("pose solve failed (object behind the camera?)")
+    return {"V": V, "F": F, "C": C, "Vu": Vu, "ms": ms, "best": best, "mpath": mpath}
+
+
+# ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
 def main():
@@ -724,16 +962,26 @@ def main():
                     help="Redo objects that already have a replacement.")
     ap.add_argument("--crop-fg-ratio", type=float, default=0.85)
     ap.add_argument("--mask-erode", type=int, default=2, help="px to shrink the mask (removes background halo)")
-    ap.add_argument("--min-mask-px", type=int, default=40, help="skip objects whose mask is smaller than this")
+    ap.add_argument("--min-mask-px", type=int, default=90,
+                    help="an object must be at least this many pixels wide/tall in a view to be used "
+                         "(TripoSR hallucinates from tiny crops)")
+    ap.add_argument("--candidates", type=int, default=3,
+                    help="number of different crops (views) tried per object; the best-matching mesh wins")
     ap.add_argument("--mc-resolution", type=int, default=256)
     ap.add_argument("--yaw-step", type=float, default=15.0)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--min-iou", type=float, default=0.5,
-                    help="reject a replacement whose silhouette matches the real mask worse than this")
-    ap.add_argument("--accept-low", action="store_true", help="keep replacements even below --min-iou")
+    ap.add_argument("--min-iou", type=float, default=0.7,
+                    help="reject a replacement whose mean silhouette IoU (over all views) is below this")
+    ap.add_argument("--min-view-iou", type=float, default=0.55,
+                    help="reject if the shape matches ANY selected view worse than this (views must agree)")
+    ap.add_argument("--max-fit-error", type=float, default=0.08,
+                    help="reject if, after fitting, the mesh box differs from the real mask boxes by more than "
+                         "this fraction of the object size (views disagree about size/position)")
+    ap.add_argument("--accept-low", action="store_true",
+                    help="keep replacements even when they fail --min-iou / --min-view-iou / --max-fit-error")
     ap.add_argument("--no-photo-colors", action="store_true",
                     help="keep TripoSR's own vertex colours instead of colouring from your photos")
-    ap.add_argument("--max-color-views", type=int, default=4)
+    ap.add_argument("--max-color-views", type=int, default=5)
     ap.add_argument("--min-points", type=int, default=800, help="guard: skip objects with fewer points")
     ap.add_argument("--max-scene-frac", type=float, default=0.2,
                     help="guard: skip objects holding more than this fraction of all splats")
@@ -743,6 +991,15 @@ def main():
     ap.add_argument("--scale-mode", choices=["image", "cluster"], default="image",
                     help="image: fit scale+position to the real masks in all views (default); "
                          "cluster: just match the measured cluster bounding box")
+    ap.add_argument("--allow-point-masks", action="store_true",
+                    help="also use views whose mask comes only from the 3D points (unreliable when clusters are inflated)")
+    ap.add_argument("--size-weight", type=float, default=0.1,
+                    help="how strongly the pose solve prefers the 3D-cluster size (0 = ignore it; clusters can be inflated)")
+    ap.add_argument("--scale-ratio", nargs=2, type=float, default=[0.25, 3.0], metavar=("LO", "HI"),
+                    help="LO: below this fitted/cluster size ratio only a note is printed (cluster inflated); "
+                         "HI: above this the replacement is rejected")
+    ap.add_argument("--no-virtual-views", action="store_true",
+                    help="only use YOLO frames as views (old behaviour)")
     ap.add_argument("--up", nargs=3, type=float, default=None, metavar=("X", "Y", "Z"),
                     help="override the automatic world-up direction (PLY space)")
     args = ap.parse_args()
@@ -782,7 +1039,8 @@ def main():
 
     poses = load_poses(base)
     rng = np.random.default_rng(args.seed)
-    clean_xyz, _ = load_clean_xyz(base)
+    splat_xyz, splat_op = load_clean_splats(base)
+    clean_xyz = None if splat_xyz is None else splat_xyz.astype(np.float64)
     if args.up:
         up = np.array(args.up, float)
         up /= np.linalg.norm(up)
@@ -809,107 +1067,128 @@ def main():
             print("\nNothing left after the guards (use --no-guard to override).")
             return
 
-    # ---- stage A: pick the best photos, make crops ----
+    # ---- stage A: views. Preferred: every frame where the object's own 3D points are fully visible ----
+    virtual = {}
+    if not args.no_virtual_views:
+        have_pts = [o for o in todo if o.get("points_file") and os.path.exists(o["points_file"])]
+        if have_pts:
+            print(f"\nSearching all {len(poses)} frames for clean views of {len(have_pts)} object(s) ...")
+            virtual = compute_virtual_views(have_pts, poses, splat_xyz, splat_op, up, images_dir, args)
+        missing_pts = [o["id"] for o in todo if o["id"] not in {x["id"] for x in have_pts}]
+        if missing_pts:
+            print(f"  (no points_file for {missing_pts}: rerun build_object_meshes.py; using YOLO frames for them)")
+
     jobs = []
     for obj in todo:
         oid = obj["id"]
         pos, size, c_loc, center_world = object_center(obj)
-        views = select_views(obj, center_world, detections, poses, images_dir, masks_dir, args.max_color_views)
-        if not views and obj.get("best_frame") and obj.get("best_mask_key"):
-            views = [{"frame": obj["best_frame"], "key": obj["best_mask_key"], "score": 0.0, "touches": False,
-                      "cam_pos": poses[obj["best_frame"]][0][:3, 3]}] if obj["best_frame"] in poses else []
-        print(f"\n{oid} (class={obj['class']}): {len(views)} usable view(s): "
-              f"{[v['frame'] for v in views]}")
-        if not views:
-            print("  no usable frame/mask for this object, skipping")
-            continue
         vds = []
-        for vw in views:
-            ip = os.path.join(images_dir, vw["frame"])
-            npz = os.path.join(masks_dir, os.path.splitext(vw["frame"])[0] + ".npz")
-            if not (os.path.exists(ip) and os.path.exists(npz) and vw["frame"] in poses):
-                continue
-            im = cv2.imread(ip)
-            mk = np.load(npz)[vw["key"]]
-            if im is None:
-                continue
-            if mk.shape != im.shape[:2]:
-                mk = cv2.resize(mk.astype(np.uint8), (im.shape[1], im.shape[0]),
-                                interpolation=cv2.INTER_NEAREST) > 0
-            mk = mk.astype(bool)
-            if mk.sum() == 0:
-                continue
-            c2w_v, cam_v = poses[vw["frame"]]
-            vds.append({"frame": vw["frame"], "img": im, "mask": mk, "c2w": c2w_v, "cam": cam_v})
+        if oid in virtual and virtual[oid]:
+            chosen = pick_spread(virtual[oid], center_world, args.max_color_views * 4)
+            for c in chosen:
+                if len(vds) >= args.max_color_views:
+                    break
+                vd = load_view(c["frame"], c["mask"], poses, images_dir, detections, obj["class"], masks_dir,
+                               center_world=center_world, allow_point_masks=args.allow_point_masks)
+                if vd is not None and vd["mask"].any():
+                    vd["elev"] = round(c["elev"], 1)
+                    vds.append(vd)
+            kind = "3D-visible+YOLO"
         if not vds:
-            print("  missing frame or mask file, skipping")
+            if oid in virtual and virtual[oid]:
+                print(f"  {oid}: no 3D-visible frame has a YOLO mask inside the object's footprint; "
+                      f"falling back to YOLO-detected frames")
+            vds = []
+            kind = "YOLO-detected"
+        if not vds:
+            views = select_views(obj, center_world, detections, poses, images_dir, masks_dir, args.max_color_views)
+            for vw in views:
+                npz = os.path.join(masks_dir, os.path.splitext(vw["frame"])[0] + ".npz")
+                if not os.path.exists(npz) or vw["frame"] not in poses:
+                    continue
+                mk = np.load(npz)[vw["key"]].astype(bool)
+                im_ = cv2.imread(os.path.join(images_dir, vw["frame"]))
+                if im_ is None:
+                    continue
+                c2w_, cam_ = poses[vw["frame"]]
+                vds.append({"frame": vw["frame"], "img": im_, "mask": mk, "c2w": c2w_, "cam": cam_,
+                            "mask_src": "yolo"})
+            kind = "YOLO-detected"
+        print(f"\n{oid} (class={obj['class']}): {len(vds)} {kind} view(s): "
+              f"{[(v['frame'], v['mask_src'], v.get('elev')) for v in vds]}")
+        if not vds:
+            print("  never seen large/complete enough in any frame, skipping")
             continue
-        img, mask = vds[0]["img"], vds[0]["mask"]
-        main = {"frame": vds[0]["frame"]}
-        ys, xs = np.nonzero(mask)
-        if min(xs.max() - xs.min(), ys.max() - ys.min()) < args.min_mask_px:
-            print(f"  mask too small (<{args.min_mask_px}px), TripoSR would hallucinate, skipping")
-            continue
-        crop, touches, _ = make_triposr_crop(img, mask, args.crop_fg_ratio, args.mask_erode)
-        if touches:
-            print("  WARNING: mask touches the image border (object cut off) -> result may be poor")
-        crop_path = os.path.join(gen_dir, f"{oid}_crop.png")
-        cv2.imwrite(crop_path, crop)
-        jobs.append({"obj": obj, "crop_path": crop_path, "touches": touches, "view_data": vds})
-        print(f"  crop from {main['frame']} -> {crop_path}")
+        crops = []
+        for j, vd in enumerate(vds[:args.candidates]):
+            crop, touches, _ = make_triposr_crop(vd["img"], vd["mask"], args.crop_fg_ratio, args.mask_erode)
+            cp = os.path.join(gen_dir, f"{oid}_crop{j}.png")
+            cv2.imwrite(cp, crop)
+            crops.append({"path": cp, "frame": vd["frame"], "touches": touches})
+        jobs.append({"obj": obj, "view_data": vds, "crops": crops})
+        print(f"  {len(crops)} candidate crop(s) -> {gen_dir}\\{oid}_crop*.png")
 
     if not jobs:
         print("\nNothing to generate.")
         return
 
-    # ---- stage B: TripoSR ----
-    mesh_paths = run_triposr([j["crop_path"] for j in jobs], args.triposr_dir,
-                             os.path.join(gen_dir, "_triposr_batch"), args.mc_resolution)
+    # ---- stage B: TripoSR for every crop of every object in ONE call ----
+    all_crops = [c["path"] for j in jobs for c in j["crops"]]
+    mesh_paths = run_triposr(all_crops, args.triposr_dir, os.path.join(gen_dir, "_triposr_batch"), args.mc_resolution)
+    k = 0
+    for j in jobs:
+        for c in j["crops"]:
+            c["mesh"] = mesh_paths[k]
+            k += 1
 
-    # ---- stage C: align, scale, write ----
+    # ---- stage C: fit every candidate, keep the one that matches reality best ----
     ok_count, fail_count = 0, 0
-    for job, mpath in zip(jobs, mesh_paths):
+    for job in jobs:
         obj = job["obj"]
         oid = obj["id"]
-        print(f"\n{oid}: post-processing")
-        if not mpath:
-            print("  no mesh generated, keeping original mesh")
+        vds = job["view_data"]
+        print(f"\n{oid}: fitting {len(job['crops'])} candidate mesh(es) against {len(vds)} view(s)")
+        pos, size, c_loc, center_world = object_center(obj)
+        fits = []
+        for ci, c in enumerate(job["crops"]):
+            if not c.get("mesh"):
+                print(f"  candidate {ci} ({c['frame']}): TripoSR produced no mesh")
+                continue
+            try:
+                fc = fit_candidate(c["mesh"], size, center_world, vds, up, args, rng)
+            except Exception as e:
+                print(f"  candidate {ci} ({c['frame']}): failed ({type(e).__name__}: {e})")
+                continue
+            fc["crop_index"], fc["crop_frame"], fc["touches"] = ci, c["frame"], c["touches"]
+            b = fc["best"]
+            print(f"  candidate {ci} ({c['frame']}): mean IoU {b['iou']:.2f}  colour diff {b['cdiff']:.2f}  "
+                  f"match score {b['score']:.3f}")
+            fits.append(fc)
+        if not fits:
+            print("  no usable candidate, keeping original mesh")
             fail_count += 1
             continue
         try:
-            V, F, C = read_obj(mpath)
-            if len(V) < 50 or len(F) < 50:
-                raise RuntimeError("generated mesh is empty")
-            V, F, C = keep_main_components(V, F, C)
-            F, _ = fix_winding(V, F)
-            print(f"  generated mesh: {len(V)} verts, {len(F)} tris, "
-                  f"vertex colours: {'yes' if C is not None else 'NO (will be gray)'}")
-
-            # unit-size, bbox-centred
-            ctr = (V.max(0) + V.min(0)) / 2
-            Vu = (V - ctr) / max((V.max(0) - V.min(0)).max(), 1e-9)
-
-            # original object-local bbox centre (where the old mesh sat relative to 'position')
-            pos, size, c_loc, center_world = object_center(obj)
-            vds = job["view_data"]
-
-            P, PC = sample_surface(Vu, F, C, N_SAMPLES, rng)
-            ms = MultiSolver(Vu, P, PC, size, center_world, vds)
-            best = solve_pose(ms, up, args.yaw_step)
-            if best is None or all(o is None for o in best["render"]):
-                raise RuntimeError("pose solve failed (object behind the camera?)")
-            R = best["R"]
+            fc = max(fits, key=lambda x: x["best"]["score"])
+            best, ms = fc["best"], fc["ms"]
+            V, F, C, Vu, R = fc["V"], fc["F"], fc["C"], fc["Vu"], best["R"]
             per_view_iou = [round(float(sv.score(R)[1]), 2) if o is not None else None
                             for sv, o in zip(ms.solvers, best["render"])]
-            print(f"  pose: axis#{best['axis_index']} yaw={best['yaw_deg']:.0f} deg  "
-                  f"mean silhouette IoU={best['iou']:.2f} over {len(vds)} view(s) {per_view_iou}  "
-                  f"colour diff={best['cdiff']:.2f}")
+            print(f"  -> using candidate {fc['crop_index']} ({fc['crop_frame']}): axis#{best['axis_index']} "
+                  f"yaw={best['yaw_deg']:.0f} deg  mean silhouette IoU={best['iou']:.2f} over {len(vds)} view(s) "
+                  f"{per_view_iou}  colour diff={best['cdiff']:.2f}")
             low_conf = best["iou"] < 0.6
             save_debug(os.path.join(gen_dir, f"{oid}_align.png"), ms.solvers, best["render"])
             if best["iou"] < args.min_iou and not args.accept_low:
                 print(f"  REJECTED: generated shape does not match the real silhouettes "
                       f"(IoU {best['iou']:.2f} < {args.min_iou}); keeping the original mesh. "
                       f"(see {oid}_align.png; --accept-low to keep anyway)")
+                fail_count += 1
+                continue
+            worst = min([x for x in per_view_iou if x is not None], default=0.0)
+            if worst < args.min_view_iou and not args.accept_low:
+                print(f"  REJECTED: the views disagree (worst per-view IoU {worst:.2f} < {args.min_view_iou}); "
+                      f"keeping the original mesh. (see {oid}_align.png; --accept-low to keep anyway)")
                 fail_count += 1
                 continue
             if low_conf:
@@ -926,8 +1205,22 @@ def main():
                 s, t_fit, fit_err = refine_placement(Vr_c, s_cluster, center_world, size, ms.solvers)
                 print(f"  scale: cluster-box {s_cluster:.4f} -> fitted to real masks {s:.4f}; "
                       f"moved {np.round(t_fit, 3)}; box fit error {100 * fit_err:.1f}% of object size in image")
-                if not (0.4 < s / s_cluster < 2.5):
-                    print("  WARNING: fitted scale differs a lot from the cluster estimate")
+                ratio = s / s_cluster
+                if ratio > args.scale_ratio[1] and not args.accept_low:
+                    print(f"  REJECTED: fitted size is {ratio:.1f}x the measured 3D cluster (a real object cannot be "
+                          f"bigger than its own cluster) -- views and 3D points disagree; keeping the original mesh. "
+                          f"(--accept-low to keep)")
+                    fail_count += 1
+                    continue
+                if ratio < args.scale_ratio[0]:
+                    print(f"  NOTE: fitted size is only {ratio:.2f}x the 3D cluster -> the cluster is inflated "
+                          f"(swallowed floor/neighbours); the image fit is trusted")
+                if fit_err > args.max_fit_error and not args.accept_low:
+                    print(f"  REJECTED: mesh cannot be fitted consistently to all views "
+                          f"(box error {100 * fit_err:.1f}% > {100 * args.max_fit_error:.0f}%); "
+                          f"keeping the original mesh. (--accept-low to keep anyway)")
+                    fail_count += 1
+                    continue
             vs = Vr_c * s + c_loc + t_fit
             print(f"  final size {np.round(vs.max(0) - vs.min(0), 3)} vs cluster-measured {np.round(size, 3)} "
                   f"(cluster axis-ratio spread x{spread:.2f})")
@@ -954,9 +1247,9 @@ def main():
                                         "placement_offset": [round(float(x), 4) for x in t_fit],
                                         "box_fit_error": None if fit_err is None else round(fit_err, 4),
                                         "scale_spread": round(spread, 3), "low_confidence": bool(low_conf),
-                                        "crop_touches_border": bool(job["touches"]),
+                                        "crop_touches_border": bool(fc["touches"]),
                                         "photo_color_coverage": None if photo_cov is None else round(photo_cov, 3),
-                                        "source_frame": vds[0]["frame"],
+                                        "source_frame": fc["crop_frame"],
                                         "color_frames": [v["frame"] for v in vds]}
             obj["world_up"] = [round(float(x), 5) for x in up]
             obj["replace_region"] = {"min": (pos + vs.min(0)).tolist(), "max": (pos + vs.max(0)).tolist()}
@@ -970,9 +1263,9 @@ def main():
         json.dump(manifest, f, indent=2)
 
     print("\n" + "=" * 50)
-    print(f"Replaced: {ok_count}   failed/skipped: {fail_count}")
+    print(f"Replaced: {ok_count}   failed/skipped/rejected: {fail_count}")
     print(f"Manifest updated: {manifest_path}")
-    print("Check the *_align.png images in output\\generated (left=mask, middle=render, right=overlap).")
+    print("Check the *_align.png images in output\\generated (rows = views; left=mask, middle=render, right=overlap).")
     print("Next: python replace_splats.py --base-dir <capture_dir>   (removes the old splats)")
 
 

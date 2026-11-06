@@ -1,32 +1,32 @@
 """
-build_object_meshes.py
+build_object_meshes.py   (v2: visibility-aware voting)
 
 Multi-class object mesh extraction. For every class present in
 detections_seg.json (or every class in --target-classes if given):
 
-  1. Projects every trained Gaussian-Splat point into every camera frame.
-  2. Checks whether the projected pixel falls inside a YOLO-SEG mask for
-     that class in that frame.
-  3. A point that lands inside a mask in enough DIFFERENT frames gets a
-     vote for that class.
+  1. Projects every trained Gaussian-Splat point into every camera frame that
+     has a detection.
+  2. NEW: keeps only splats that are the FIRST VISIBLE SURFACE along their camera
+     ray (a coarse z-buffer made from the splats themselves). Before this, every
+     splat BEHIND an object (the floor under a laptop, the whole room behind a
+     chair) also fell inside the object's 2D mask and got a vote, which produced
+     scene-sized "objects" and phantom clusters on the floor.
+  3. A visible splat that lands inside a YOLO-SEG mask for that class in enough
+     DIFFERENT frames gets a vote.
   4. DBSCAN-clusters voted points into individual object instances.
   5. Reconstructs a real mesh per cluster with Open3D alpha-shape.
-  6. Records quality metrics (triangle_count, bbox_aspect_ratio) per
-     object into the manifest, for a later treatment-classification step
-     to decide keep/regularize/generative-replace without needing an AI
-     call.
+  6. Records quality metrics (triangle_count, bbox_aspect_ratio) per object.
 
 Requires (already produced earlier in your pipeline):
-  - output/ply/point_cloud_<N>.ply           (trained splat, from gsplat)
-  - sparse/0/images.bin, cameras.bin          (raw COLMAP poses/intrinsics)
-  - output/normalization.json                 (from compute_transform.py)
-  - segmentation/detections_seg.json + masks/ (from run_yolo_segmentation.py)
+  - output/ply/point_cloud_<N>_clean.ply      (cleaned splat, from clean_gaussians.py)
+  - sparse/0/images.bin, cameras.bin           (raw COLMAP poses/intrinsics)
+  - output/normalization.json                  (from compute_transform.py)
+  - segmentation/detections_seg.json + masks/  (from run_yolo_segmentation.py)
 
 Usage:
     python build_object_meshes.py --base-dir <capture_dir> --max-steps 30000
-    python build_object_meshes.py --base-dir <capture_dir> --max-steps 30000 --target-classes chair table
-
-NOTE: reads point_cloud_<N>_clean.ply by default (run clean_gaussians.py first).
+    python build_object_meshes.py --base-dir <capture_dir> --max-steps 30000 --target-classes chair laptop
+    python build_object_meshes.py ... --no-visibility        (old behaviour, for comparison)
 """
 import os
 import json
@@ -34,6 +34,7 @@ import argparse
 import numpy as np
 import open3d as o3d
 from plyfile import PlyData
+from scipy import ndimage
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--base-dir", required=True)
@@ -47,21 +48,26 @@ parser.add_argument("--target-classes", nargs="+", default=None,
                      help="Classes to reconstruct. Defaults to every class "
                           "present in detections_seg.json.")
 parser.add_argument("--min-frame-votes", type=int, default=3,
-                     help="A point must land inside the mask in at least "
-                          "this many distinct frames to count as 'on the "
-                          "object'. Raise this if you get floor/wall bleed; "
-                          "lower it if objects come out too sparse/holey.")
-parser.add_argument("--dbscan-eps", type=float, default=0.05,
-                     help="Same normalized-scene scale as check.py's sweep "
-                          "-- run check.py first if unsure.")
+                     help="A visible point must land inside the mask in at least "
+                          "this many distinct frames to count as 'on the object'.")
+parser.add_argument("--min-vote-ratio", type=float, default=0.3,
+                     help="A point must ALSO be inside the class mask in at least this share of the frames "
+                          "(where that class was detected) in which it is visible. Stops floors / big "
+                          "objects from merging with the chair next to them. 0 = off (old behaviour).")
+parser.add_argument("--dbscan-eps", type=float, default=0.05)
 parser.add_argument("--dbscan-min-points", type=int, default=30)
 parser.add_argument("--alpha", type=float, default=0.05,
-                     help="Open3D alpha-shape parameter -- smaller = tighter "
-                          "surface that follows concave detail, larger = "
-                          "smoother but may fill gaps.")
+                     help="Open3D alpha-shape parameter -- smaller = tighter surface.")
 parser.add_argument("--min-cluster-size", type=int, default=80,
-                     help="Discard DBSCAN clusters smaller than this -- "
-                          "filters out noise blobs that aren't real objects.")
+                     help="Discard DBSCAN clusters smaller than this.")
+parser.add_argument("--no-visibility", action="store_true",
+                     help="Disable the first-visible-surface test (old, leaky voting).")
+parser.add_argument("--vis-tol", type=float, default=0.03,
+                     help="Depth tolerance (scene units) for 'same surface as the front-most splat'.")
+parser.add_argument("--vis-opacity", type=float, default=0.3,
+                     help="Only splats at least this opaque can occlude others in the z-buffer.")
+parser.add_argument("--vis-grid-div", type=int, default=8,
+                     help="z-buffer cell size in pixels.")
 args = parser.parse_args()
 
 BASE_DIR = args.base_dir
@@ -73,6 +79,8 @@ MASKS_DIR = os.path.join(SEG_DIR, "masks")
 print(f"Using BASE_DIR: {BASE_DIR}")
 os.makedirs(MESH_DIR, exist_ok=True)
 
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from colmap_io import read_images_binary, read_cameras_binary, qvec_to_rotmat
 
 
@@ -87,7 +95,12 @@ print(f"Using splat file: {ply_path}")
 ply = PlyData.read(ply_path)
 v = ply["vertex"]
 points = np.stack([v["x"], v["y"], v["z"]], axis=1).astype(np.float64)
-print(f"Loaded {len(points)} trained splat points")
+if "opacity" in v.data.dtype.names:
+    opacity = 1.0 / (1.0 + np.exp(-np.asarray(v["opacity"], dtype=np.float64)))
+else:
+    opacity = np.ones(len(points))
+solid = opacity >= args.vis_opacity
+print(f"Loaded {len(points)} trained splat points ({int(solid.sum())} opaque enough to occlude)")
 
 images = read_images_binary(os.path.join(SPARSE_DIR, "images.bin"))
 cameras = read_cameras_binary(os.path.join(SPARSE_DIR, "cameras.bin"))
@@ -107,6 +120,31 @@ def project(cam_pts, cam, mask_shape):
     ui = np.clip((u * mw / cam.width).astype(np.int32), 0, mw - 1)
     vi = np.clip((v_ * mh / cam.height).astype(np.int32), 0, mh - 1)
     return ui, vi, ok
+
+
+def first_visible(cam_pts, cam):
+    """Boolean per point: in the image AND not hidden behind a nearer opaque splat.
+    Coarse z-buffer (cells of --vis-grid-div px; empty cells are filled from their
+    neighbours so gaps between splat centres don't let background leak through)."""
+    z = cam_pts[:, 2]
+    zs = np.clip(z, 1e-6, None)
+    u = cam.fx * cam_pts[:, 0] / zs + cam.cx
+    vv = cam.fy * cam_pts[:, 1] / zs + cam.cy
+    ok = (z > 1e-6) & (u >= 0) & (u < cam.width) & (vv >= 0) & (vv < cam.height)
+    if args.no_visibility:
+        return ok
+    d = float(args.vis_grid_div)
+    gw, gh = max(int(cam.width / d), 2), max(int(cam.height / d), 2)
+    gx = np.clip((u / d).astype(np.int64), 0, gw - 1)
+    gy = np.clip((vv / d).astype(np.int64), 0, gh - 1)
+    sel = ok & solid
+    zb = np.full((gh, gw), np.inf, dtype=np.float32)
+    np.minimum.at(zb, (gy[sel], gx[sel]), z[sel].astype(np.float32))
+    # close gaps ONLY in empty cells (a min-filter over all cells would smear the near depth
+    # over steep side faces and hide visible surfaces such as chair legs / object sides)
+    zb = np.where(np.isinf(zb), ndimage.minimum_filter(zb, size=3), zb)
+    return ok & (z <= zb[gy, gx] + args.vis_tol + 0.02 * z)
+
 
 with open(os.path.join(OUTPUT_DIR, "normalization.json")) as f:
     T = np.array(json.load(f)["transform"])
@@ -133,45 +171,69 @@ all_classes_present = sorted({e["class"] for ents in detections.values() for e i
 target_classes = args.target_classes if args.target_classes else all_classes_present
 print(f"\nProcessing classes: {target_classes}")
 
+# ---- pass 1: vote, all classes at once (each frame is projected only once) ----
+votes = {c: np.zeros(len(points), dtype=np.int16) for c in target_classes}
+seen = {c: np.zeros(len(points), dtype=np.int16) for c in target_classes}
+frames_with = {c: [] for c in target_classes}
+for fname, ents in detections.items():
+    for c in {e["class"] for e in ents}:
+        if c in votes:
+            frames_with[c].append(fname)
+frames_needed = sorted({f for fl in frames_with.values() for f in fl})
+print(f"Voting over {len(frames_needed)} frames "
+      f"({'first-visible-surface only' if not args.no_visibility else 'NO visibility test'}) ...")
+
+pts32 = points.astype(np.float32)
+for fi, fname in enumerate(frames_needed):
+    if fname not in frame_c2w:
+        continue
+    npz_path = os.path.join(MASKS_DIR, os.path.splitext(fname)[0] + ".npz")
+    if not os.path.exists(npz_path):
+        continue
+    w2c = np.linalg.inv(frame_c2w[fname])
+    cam_pts = pts32 @ w2c[:3, :3].T.astype(np.float32) + w2c[:3, 3].astype(np.float32)
+    cam = frame_cam[fname]
+    vis = first_visible(cam_pts, cam)
+    masks = np.load(npz_path)
+    ent_list = detections[fname]
+    if ent_list:
+        shape0 = masks[ent_list[0]["mask_key"]].shape
+        _u, _v, ok_img = project(cam_pts, cam, shape0)
+        for c in {e["class"] for e in ent_list}:
+            if c in seen:
+                seen[c][vis & ok_img] += 1
+    for ent in ent_list:
+        c = ent["class"]
+        if c not in votes:
+            continue
+        mask = masks[ent["mask_key"]]
+        ui, vi, ok = project(cam_pts, cam, mask.shape)
+        hit = vis & ok & mask[vi, ui].astype(bool)
+        votes[c][hit] += 1
+    if (fi + 1) % 50 == 0 or fi == len(frames_needed) - 1:
+        print(f"  voted {fi + 1}/{len(frames_needed)} frames")
+
 manifest = []
-pts_h_all = np.hstack([points, np.ones((len(points), 1))])
+pts_h_all = None
 
 for target_class in target_classes:
     print(f"\n{'='*50}")
     print(f"Class: {target_class}")
     print(f"{'='*50}")
 
-    vote_counts = np.zeros(len(points), dtype=np.int32)
-    frames_with_target = [f for f, ents in detections.items()
-                           if any(e["class"] == target_class for e in ents)]
+    frames_with_target = frames_with[target_class]
     print(f"{len(frames_with_target)} frames contain '{target_class}' detections")
     if len(frames_with_target) == 0:
         continue
 
-    for fname in frames_with_target:
-        if fname not in frame_c2w:
-            continue
-        c2w = frame_c2w[fname]
-        w2c = np.linalg.inv(c2w)
-
-        cam_pts = (w2c @ pts_h_all.T).T[:, :3]
-
-        stem = os.path.splitext(fname)[0]
-        npz_path = os.path.join(MASKS_DIR, f"{stem}.npz")
-        if not os.path.exists(npz_path):
-            continue
-        masks = np.load(npz_path)
-
-        for ent in detections[fname]:
-            if ent["class"] != target_class:
-                continue
-            mask = masks[ent["mask_key"]]
-            ui, vi, ok = project(cam_pts, frame_cam[fname], mask.shape)
-            hit = ok & mask[vi, ui].astype(bool)
-            vote_counts[hit] += 1
-
-    voted = points[vote_counts >= args.min_frame_votes]
-    print(f"{len(voted)} points reached >= {args.min_frame_votes} frame votes for '{target_class}'")
+    v_c, s_c = votes[target_class].astype(np.float32), np.maximum(seen[target_class], 1).astype(np.float32)
+    base_ok = v_c >= args.min_frame_votes
+    ratio = v_c / s_c
+    row = "  ".join(f"r>={r:.1f}:{int((base_ok & (ratio >= r)).sum())}" for r in (0.0, 0.2, 0.3, 0.4, 0.5, 0.6))
+    print(f"points surviving per vote ratio (>= {args.min_frame_votes} votes): {row}")
+    keep_mask = base_ok & (ratio >= args.min_vote_ratio)
+    voted = points[keep_mask]
+    print(f"{len(voted)} points kept (>= {args.min_frame_votes} votes and ratio >= {args.min_vote_ratio}) for '{target_class}'")
     if len(voted) < args.dbscan_min_points:
         print(f"  too few voted points for '{target_class}' (need >= {args.dbscan_min_points}), skipping")
         continue
@@ -214,7 +276,6 @@ for target_class in target_classes:
         bbox = cluster_pcd.get_axis_aligned_bounding_box()
         dims = (bbox.get_max_bound() - bbox.get_min_bound()).tolist()
 
-        # ---- quality metrics for later treatment classification ----
         sorted_dims = sorted(dims, reverse=True)
         bbox_aspect_ratio = sorted_dims[0] / max(sorted_dims[-1], 1e-6)
         triangle_count = len(mesh.triangles)
@@ -222,6 +283,8 @@ for target_class in target_classes:
 
         obj_name = f"{target_class}_{kept}.obj"
         obj_path = os.path.join(MESH_DIR, obj_name)
+        points_path = os.path.join(MESH_DIR, f"{target_class}_{kept}_points.npy")
+        np.save(points_path, cluster_pts.astype(np.float32))   # used by generate_replacement.py to find clean views
         mesh.triangle_normals = o3d.utility.Vector3dVector()  # OBJ cannot store them
         o3d.io.write_triangle_mesh(obj_path, mesh)
 
@@ -230,15 +293,10 @@ for target_class in target_classes:
             if e["class"] == target_class
         ]))
 
-                # ---- find the best-matching frame for THIS SPECIFIC instance,
-        # not just "any frame with this class" -- needed so generative
-        # replacement can crop the right object when multiple instances
-        # of the same class exist (e.g. 3 different chairs). Reuses the
-        # cluster's own (uncentered) points and checks, per frame, how
-        # many actually project inside a real mask for this class. ----
+        # ---- best-matching frame for THIS instance (kept for compatibility;
+        # generate_replacement.py now selects its own views) ----
         best_frame, best_mask_key, best_overlap, best_conf = None, None, -1, 0.0
-        cluster_pts_world = cluster_pts  # original coords, pre-centering
-        cpts_h = np.hstack([cluster_pts_world, np.ones((len(cluster_pts_world), 1))])
+        cpts_h = np.hstack([cluster_pts, np.ones((len(cluster_pts), 1))])
 
         for fname in frames_with_target:
             if fname not in frame_c2w:
@@ -246,8 +304,7 @@ for target_class in target_classes:
             w2c_f = np.linalg.inv(frame_c2w[fname])
             cam_pts_f = (w2c_f @ cpts_h.T).T[:, :3]
 
-            stem_f = os.path.splitext(fname)[0]
-            npz_path_f = os.path.join(MASKS_DIR, f"{stem_f}.npz")
+            npz_path_f = os.path.join(MASKS_DIR, os.path.splitext(fname)[0] + ".npz")
             if not os.path.exists(npz_path_f):
                 continue
             masks_f = np.load(npz_path_f)
@@ -280,11 +337,12 @@ for target_class in target_classes:
             "mass": 5.0,
             "drag": 0.5,
             "mesh_file": obj_path,
+            "points_file": points_path,
             "source_ply": os.path.basename(ply_path),
         })
         print(f"  cluster {cluster_id} -> {obj_name}: "
               f"{point_count} pts, {triangle_count} triangles, "
-              f"aspect={bbox_aspect_ratio:.2f}, centroid={np.round(centroid, 3)}")
+              f"aspect={bbox_aspect_ratio:.2f}, size={np.round(dims, 3)}, centroid={np.round(centroid, 3)}")
         kept += 1
 
     print(f"Wrote {kept} '{target_class}' mesh(es)")

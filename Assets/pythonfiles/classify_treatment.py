@@ -56,7 +56,9 @@ for obj in manifest:
 
     # quality-metric override: even a class that's usually fine gets
     # flagged if THIS specific instance came out too sparse to trust
-    if obj.get("triangle_count", 9999) < args.min_triangle_count:
+    # (flat/support classes such as table/floor are exempt: a small fragment of a table is NOT a
+    #  small object, and must never be sent to the object generator)
+    if obj.get("triangle_count", 9999) < args.min_triangle_count and default_treatment != "regularize_plane":
         treatment = "generative_replace"
     else:
         treatment = default_treatment
