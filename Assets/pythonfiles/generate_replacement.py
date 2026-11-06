@@ -62,6 +62,7 @@ from scipy.sparse.csgraph import connected_components
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from colmap_io import read_images_binary, read_cameras_binary, qvec_to_rotmat
 
+VERSION = "v5 (multi-view pose, mask-fitted scale, numpy colour sampling)"
 GRID = 96            # silhouette comparison grid (longest side, pixels)
 N_SAMPLES = 40000    # surface samples used for projection
 
@@ -275,6 +276,10 @@ def run_triposr(crop_paths, triposr_dir, batch_dir, mc_resolution):
     if os.path.exists(batch_dir):
         shutil.rmtree(batch_dir)
     os.makedirs(batch_dir)
+    # TripoSR only creates <out>/<i>/ itself when it runs its own background removal;
+    # with --no-remove-bg the export fails (FileNotFoundError) unless the folders exist.
+    for i in range(len(crop_paths)):
+        os.makedirs(os.path.join(batch_dir, str(i)), exist_ok=True)
 
     print(f"\nRunning TripoSR on {len(crop_paths)} crop(s) in one call ...")
     r = subprocess.run([sys.executable, run_py] + list(crop_paths) + ["--output-dir", batch_dir] + flags,
@@ -294,7 +299,7 @@ def run_triposr(crop_paths, triposr_dir, batch_dir, mc_resolution):
         if i < len(results) and results[i]:
             continue
         od = os.path.join(batch_dir, f"single_{i}")
-        os.makedirs(od, exist_ok=True)
+        os.makedirs(os.path.join(od, "0"), exist_ok=True)
         rr = subprocess.run([sys.executable, run_py, cp, "--output-dir", od] + flags, cwd=triposr_dir)
         results[i] = find_mesh(od) if rr.returncode == 0 else None
         if results[i] is None:
@@ -368,6 +373,41 @@ class PoseSolver:
         return iou - 0.7 * cdiff, iou, cdiff, out
 
 
+class MultiSolver:
+    """Scores a candidate rotation against ALL selected views (silhouette IoU + colour) and
+    against the measured object size. One steep top-down view cannot tell 'lying flat' from
+    'standing on edge'; several views from different angles can."""
+
+    def __init__(self, Vu, P, PC, size, center_world, views, size_weight=0.5):
+        self.size = np.maximum(np.asarray(size, float), 1e-4)
+        self.Vsub = Vu[:: max(1, len(Vu) // 4000)]
+        self.size_weight = size_weight
+        s0 = float(self.size.max())
+        self.solvers = []
+        for vw in views:
+            H, W = vw["img"].shape[:2]
+            self.solvers.append(PoseSolver(P, PC, s0, center_world, vw["c2w"], vw["cam"], (W, H),
+                                           Reference(vw["img"], vw["mask"])))
+
+    def size_term(self, R):
+        Vr = self.Vsub @ R.T
+        ext = np.maximum(Vr.max(0) - Vr.min(0), 1e-6)
+        return float(np.log(self.size / ext).std())
+
+    def score(self, R):
+        scs, ious, cds, outs = [], [], [], []
+        for sv in self.solvers:
+            sc, iou, cd, out = sv.score(R)
+            outs.append(out)
+            if out is None:
+                continue
+            scs.append(sc); ious.append(iou); cds.append(cd)
+        if not scs:
+            return -9.0, 0.0, 1.0, outs
+        st = self.size_term(R)
+        return float(np.mean(scs)) - self.size_weight * st, float(np.mean(ious)), float(np.mean(cds)), outs
+
+
 def solve_pose(solver, up, yaw_step_deg):
     canon = [np.array(a, float) for a in
              ([1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1])]
@@ -384,46 +424,120 @@ def solve_pose(solver, up, yaw_step_deg):
         for d in np.arange(-yaw_step_deg, yaw_step_deg + 1e-6, yaw_step_deg / 5.0):
             t2 = th + d
             R = axis_rot(up, np.deg2rad(t2)) @ Ra_list[ai]
-            s2, iou, cd, out = solver.score(R)
+            s2, iou, cd, outs = solver.score(R)
             if best is None or s2 > best["score"]:
                 best = {"score": s2, "iou": iou, "cdiff": cd, "R": R, "yaw_deg": float(t2 % 360.0),
-                        "axis_index": ai, "render": out}
+                        "axis_index": ai, "render": outs}
     return best
 
 
-def save_debug(path, ref, best):
-    sil, hit, rgb = best["render"]
-    a = ref.rgb * ref.mask[..., None]
-    over = np.zeros((ref.gh, ref.gw, 3), np.float32)
-    over[..., 0] = sil
-    over[..., 1] = ref.mask
-    tile = np.concatenate([a, rgb, over], axis=1)
-    tile = (np.clip(tile, 0, 1) * 255).astype(np.uint8)
-    tile = cv2.resize(tile, None, fx=3, fy=3, interpolation=cv2.INTER_NEAREST)
+def refine_placement(Vr_centered, s_init, center_init, size, solvers):
+    """Fit uniform scale + 3D offset so the projected mesh bounding boxes match the real YOLO mask
+    boxes in every selected view (mesh shape/rotation stay fixed). Soft priors keep it near the
+    cluster-based guess when only one view constrains it."""
+    from scipy.optimize import least_squares
+    sub = Vr_centered[:: max(1, len(Vr_centered) // 6000)]
+    unit = 0.1 * float(np.max(size))
+    DW = 30.0   # a 3% box error in the image costs as much as the priors' 1-sigma
+
+    def residual(p):
+        t = p[:3] * unit
+        s = s_init * np.exp(p[3])
+        pw = sub * s + center_init + t
+        res = []
+        for sv in solvers:
+            pc = pw @ sv.Rw.T + sv.tw
+            z = pc[:, 2]
+            if (z <= 1e-6).any():
+                res += [10.0] * 4
+                continue
+            u = sv.fx * pc[:, 0] / z + sv.cx
+            v = sv.fy * pc[:, 1] / z + sv.cy
+            r = sv.ref
+            D = float(max(r.x1 - r.x0, r.y1 - r.y0) + 1)
+            res += [DW * (u.min() - r.x0) / D, DW * (u.max() - r.x1) / D,
+                    DW * (v.min() - r.y0) / D, DW * (v.max() - r.y1) / D]
+        res += list(p[:3] / 2.5)       # prior: offset within ~25% of object size
+        res += [p[3] / 0.7]            # prior: scale within ~2x of the cluster estimate
+        return np.array(res)
+
+    sol = least_squares(residual, np.zeros(4), method="trf", max_nfev=200)
+    t = sol.x[:3] * unit
+    s = float(s_init * np.exp(sol.x[3]))
+    r = residual(sol.x)[: 4 * len(solvers)] / DW
+    return s, t, float(np.abs(r).mean())
+
+
+def save_debug(path, solvers, outs):
+    rows = []
+    for sv, out in zip(solvers, outs):
+        if out is None:
+            continue
+        ref = sv.ref
+        sil, hit, rgb = out
+        a = ref.rgb * ref.mask[..., None]
+        over = np.zeros((ref.gh, ref.gw, 3), np.float32)
+        over[..., 0] = sil
+        over[..., 1] = ref.mask
+        tile = np.concatenate([a, rgb, over], axis=1)
+        rows.append((np.clip(tile, 0, 1) * 255).astype(np.uint8))
+    if not rows:
+        return
+    wmax = max(r.shape[1] for r in rows)
+    rows = [np.pad(r, ((0, 2), (0, wmax - r.shape[1]), (0, 0))) for r in rows]
+    tile = cv2.resize(np.concatenate(rows, axis=0), None, fx=3, fy=3, interpolation=cv2.INTER_NEAREST)
     cv2.imwrite(path, cv2.cvtColor(tile, cv2.COLOR_RGB2BGR))
 
 
 # ----------------------------------------------------------------------------
 # guards, automatic view selection, photo colouring
 # ----------------------------------------------------------------------------
-def scene_stats(base):
+def load_clean_xyz(base):
+    """Splat centres of the newest *_clean.ply (None if unavailable)."""
     try:
         from plyfile import PlyData
         cands = glob.glob(os.path.join(base, "output", "ply", "point_cloud_*_clean.ply"))
         if not cands:
-            return None
+            return None, None
 
         def step(p):
             m = re.search(r"point_cloud_(\d+)", os.path.basename(p))
             return int(m.group(1)) if m else -1
         p = max(cands, key=step)
         v = PlyData.read(p)["vertex"]
-        xyz = np.stack([v["x"], v["y"], v["z"]], 1)
-        lo, hi = np.percentile(xyz, 1, axis=0), np.percentile(xyz, 99, axis=0)
-        return {"n": len(xyz), "diag": float(np.linalg.norm(hi - lo)), "ply": p}
+        return np.stack([v["x"], v["y"], v["z"]], 1).astype(np.float64), p
     except Exception as e:
-        print(f"  (scene guard disabled: {e})")
+        print(f"  (could not read the clean PLY: {e})")
+        return None, None
+
+
+def scene_stats(xyz):
+    if xyz is None or len(xyz) == 0:
         return None
+    lo, hi = np.percentile(xyz, 1, axis=0), np.percentile(xyz, 99, axis=0)
+    return {"n": len(xyz), "diag": float(np.linalg.norm(hi - lo))}
+
+
+def estimate_world_up(poses, xyz, rng):
+    """World-up in PLY space.
+    Camera 'up' is unreliable when the video looks DOWN at a table (image-up is then
+    horizontal), so: if the splat scene is flat (a floor/table scene), up = its thin
+    principal axis (the floor normal) and only the SIGN comes from the cameras (they
+    are held above the objects). If the scene is not flat, fall back to camera 'up'."""
+    cam_up = world_up_from_cameras(poses)
+    if xyz is None or len(xyz) < 1000:
+        return cam_up, "cameras (no splat data)"
+    sub = xyz if len(xyz) <= 200000 else xyz[rng.choice(len(xyz), 200000, replace=False)]
+    c = np.median(sub, axis=0)
+    w, v = np.linalg.eigh(np.cov((sub - c).T))        # ascending
+    ratio = float(w[0] / max(w[1], 1e-12))
+    if ratio < 0.5:
+        n = v[:, 0]
+        cam_centers = np.array([p[0][:3, 3] for p in poses.values()])
+        if float((cam_centers.mean(0) - c) @ n) < 0:
+            n = -n
+        return n / np.linalg.norm(n), f"flat-scene axis (variance ratio {ratio:.2f}), sign from camera positions"
+    return cam_up, f"cameras (scene not flat, variance ratio {ratio:.2f})"
 
 
 def guard_reason(obj, stats, a):
@@ -518,6 +632,19 @@ def select_views(obj, center_world, detections, poses, images_dir, masks_dir, ma
              "cam_pos": c["cam_pos"]} for c in chosen]
 
 
+def bilinear_sample(img, u, v):
+    """img HxWx3 float, u/v pixel coords (arrays). Plain numpy: cv2.remap refuses > 32767 points."""
+    H, W = img.shape[:2]
+    u = np.clip(u, 0, W - 1.001)
+    v = np.clip(v, 0, H - 1.001)
+    x0 = np.floor(u).astype(np.int64)
+    y0 = np.floor(v).astype(np.int64)
+    fx = (u - x0)[:, None]
+    fy = (v - y0)[:, None]
+    return (img[y0, x0] * (1 - fx) * (1 - fy) + img[y0, x0 + 1] * fx * (1 - fy)
+            + img[y0 + 1, x0] * (1 - fx) * fy + img[y0 + 1, x0 + 1] * fx * fy)
+
+
 def vertex_normals(V, F):
     a, b, c = V[F[:, 0]], V[F[:, 1]], V[F[:, 2]]
     fn = np.cross(b - a, c - a)
@@ -572,8 +699,7 @@ def photo_colors(Vw, F, base_colors, view_data, size_ref):
         use = visible & facing & in_mask
         if use.sum() == 0:
             continue
-        col = cv2.remap(vd["rgb"], u.astype(np.float32).reshape(-1, 1), v.astype(np.float32).reshape(-1, 1),
-                        cv2.INTER_LINEAR).reshape(-1, 3)
+        col = bilinear_sample(vd["rgb"], u, v)
         w = np.where(use, np.clip(cosang, 0, 1) ** 4, 0.0)
         acc += col * w[:, None]
         wsum += w
@@ -614,8 +740,14 @@ def main():
     ap.add_argument("--max-size-frac", type=float, default=0.45,
                     help="guard: skip objects larger than this fraction of the scene extent")
     ap.add_argument("--no-guard", action="store_true", help="disable the three guards above")
+    ap.add_argument("--scale-mode", choices=["image", "cluster"], default="image",
+                    help="image: fit scale+position to the real masks in all views (default); "
+                         "cluster: just match the measured cluster bounding box")
+    ap.add_argument("--up", nargs=3, type=float, default=None, metavar=("X", "Y", "Z"),
+                    help="override the automatic world-up direction (PLY space)")
     args = ap.parse_args()
 
+    print(f"generate_replacement.py {VERSION}  ({os.path.abspath(__file__)})")
     args.triposr_dir = os.path.abspath(args.triposr_dir)
     base = os.path.abspath(args.base_dir)
     seg_dir = os.path.join(base, "segmentation")
@@ -649,13 +781,20 @@ def main():
         return
 
     poses = load_poses(base)
-    up = world_up_from_cameras(poses)
-    print(f"World up (PLY space) from cameras: {np.round(up, 3)}")
+    rng = np.random.default_rng(args.seed)
+    clean_xyz, _ = load_clean_xyz(base)
+    if args.up:
+        up = np.array(args.up, float)
+        up /= np.linalg.norm(up)
+        how = "--up override"
+    else:
+        up, how = estimate_world_up(poses, clean_xyz, rng)
+    print(f"World up (PLY space): {np.round(up, 3)}  [{how}]")
     with open(os.path.join(seg_dir, "detections_seg.json")) as f:
         detections = json.load(f)
 
     if not args.no_guard:
-        stats = scene_stats(base)
+        stats = scene_stats(clean_xyz)
         if stats:
             print(f"Scene: {stats['n']} splats, extent ~{stats['diag']:.2f}")
         kept = []
@@ -684,21 +823,29 @@ def main():
         if not views:
             print("  no usable frame/mask for this object, skipping")
             continue
-        main = views[0]
-        img_path = os.path.join(images_dir, main["frame"])
-        npz_path = os.path.join(masks_dir, os.path.splitext(main["frame"])[0] + ".npz")
-        if not (os.path.exists(img_path) and os.path.exists(npz_path)):
+        vds = []
+        for vw in views:
+            ip = os.path.join(images_dir, vw["frame"])
+            npz = os.path.join(masks_dir, os.path.splitext(vw["frame"])[0] + ".npz")
+            if not (os.path.exists(ip) and os.path.exists(npz) and vw["frame"] in poses):
+                continue
+            im = cv2.imread(ip)
+            mk = np.load(npz)[vw["key"]]
+            if im is None:
+                continue
+            if mk.shape != im.shape[:2]:
+                mk = cv2.resize(mk.astype(np.uint8), (im.shape[1], im.shape[0]),
+                                interpolation=cv2.INTER_NEAREST) > 0
+            mk = mk.astype(bool)
+            if mk.sum() == 0:
+                continue
+            c2w_v, cam_v = poses[vw["frame"]]
+            vds.append({"frame": vw["frame"], "img": im, "mask": mk, "c2w": c2w_v, "cam": cam_v})
+        if not vds:
             print("  missing frame or mask file, skipping")
             continue
-        img = cv2.imread(img_path)
-        mask = np.load(npz_path)[main["key"]]
-        if mask.shape != img.shape[:2]:
-            mask = cv2.resize(mask.astype(np.uint8), (img.shape[1], img.shape[0]),
-                              interpolation=cv2.INTER_NEAREST) > 0
-        mask = mask.astype(bool)
-        if mask.sum() == 0:
-            print("  empty mask, skipping")
-            continue
+        img, mask = vds[0]["img"], vds[0]["mask"]
+        main = {"frame": vds[0]["frame"]}
         ys, xs = np.nonzero(mask)
         if min(xs.max() - xs.min(), ys.max() - ys.min()) < args.min_mask_px:
             print(f"  mask too small (<{args.min_mask_px}px), TripoSR would hallucinate, skipping")
@@ -708,8 +855,7 @@ def main():
             print("  WARNING: mask touches the image border (object cut off) -> result may be poor")
         crop_path = os.path.join(gen_dir, f"{oid}_crop.png")
         cv2.imwrite(crop_path, crop)
-        jobs.append({"obj": obj, "img": img, "mask": mask, "crop_path": crop_path, "touches": touches,
-                     "views": views})
+        jobs.append({"obj": obj, "crop_path": crop_path, "touches": touches, "view_data": vds})
         print(f"  crop from {main['frame']} -> {crop_path}")
 
     if not jobs:
@@ -721,7 +867,6 @@ def main():
                              os.path.join(gen_dir, "_triposr_batch"), args.mc_resolution)
 
     # ---- stage C: align, scale, write ----
-    rng = np.random.default_rng(args.seed)
     ok_count, fail_count = 0, 0
     for job, mpath in zip(jobs, mesh_paths):
         obj = job["obj"]
@@ -746,22 +891,23 @@ def main():
 
             # original object-local bbox centre (where the old mesh sat relative to 'position')
             pos, size, c_loc, center_world = object_center(obj)
+            vds = job["view_data"]
 
-            bf = job["views"][0]["frame"]
-            c2w, cam = poses[bf]
-            H, W = job["img"].shape[:2]
-            ref = Reference(job["img"], job["mask"])
             P, PC = sample_surface(Vu, F, C, N_SAMPLES, rng)
-            solver = PoseSolver(P, PC, float(size.max()), center_world, c2w, cam, (W, H), ref)
-            best = solve_pose(solver, up, args.yaw_step)
-            if best is None or best["render"] is None:
-                raise RuntimeError("pose solve failed (object behind camera?)")
+            ms = MultiSolver(Vu, P, PC, size, center_world, vds)
+            best = solve_pose(ms, up, args.yaw_step)
+            if best is None or all(o is None for o in best["render"]):
+                raise RuntimeError("pose solve failed (object behind the camera?)")
+            R = best["R"]
+            per_view_iou = [round(float(sv.score(R)[1]), 2) if o is not None else None
+                            for sv, o in zip(ms.solvers, best["render"])]
             print(f"  pose: axis#{best['axis_index']} yaw={best['yaw_deg']:.0f} deg  "
-                  f"silhouette IoU={best['iou']:.2f}  colour diff={best['cdiff']:.2f}")
+                  f"mean silhouette IoU={best['iou']:.2f} over {len(vds)} view(s) {per_view_iou}  "
+                  f"colour diff={best['cdiff']:.2f}")
             low_conf = best["iou"] < 0.6
-            save_debug(os.path.join(gen_dir, f"{oid}_align.png"), ref, best)
+            save_debug(os.path.join(gen_dir, f"{oid}_align.png"), ms.solvers, best["render"])
             if best["iou"] < args.min_iou and not args.accept_low:
-                print(f"  REJECTED: generated shape does not match the real silhouette "
+                print(f"  REJECTED: generated shape does not match the real silhouettes "
                       f"(IoU {best['iou']:.2f} < {args.min_iou}); keeping the original mesh. "
                       f"(see {oid}_align.png; --accept-low to keep anyway)")
                 fail_count += 1
@@ -769,30 +915,27 @@ def main():
             if low_conf:
                 print("  WARNING: weak silhouette match -> check the *_align.png debug image")
 
-            vr = Vu @ best["R"].T
-            ext = np.maximum(vr.max(0) - vr.min(0), 1e-6)
+            Vr = Vu @ R.T
+            Vr_c = Vr - (Vr.max(0) + Vr.min(0)) / 2
+            ext = np.maximum(Vr_c.max(0) - Vr_c.min(0), 1e-6)
             ratios = size / ext
-            s = float(np.median(ratios))
+            s_cluster = float(np.median(ratios))
             spread = float(ratios.max() / max(ratios.min(), 1e-9))
-            vs = vr * s
-            vs = vs - (vs.max(0) + vs.min(0)) / 2 + c_loc
-            print(f"  scale {s:.4f} (axis-ratio spread x{spread:.2f}), size {np.round(vs.max(0) - vs.min(0), 3)} "
-                  f"vs measured {np.round(size, 3)}")
+            t_fit, fit_err, s = np.zeros(3), None, s_cluster
+            if args.scale_mode == "image":
+                s, t_fit, fit_err = refine_placement(Vr_c, s_cluster, center_world, size, ms.solvers)
+                print(f"  scale: cluster-box {s_cluster:.4f} -> fitted to real masks {s:.4f}; "
+                      f"moved {np.round(t_fit, 3)}; box fit error {100 * fit_err:.1f}% of object size in image")
+                if not (0.4 < s / s_cluster < 2.5):
+                    print("  WARNING: fitted scale differs a lot from the cluster estimate")
+            vs = Vr_c * s + c_loc + t_fit
+            print(f"  final size {np.round(vs.max(0) - vs.min(0), 3)} vs cluster-measured {np.round(size, 3)} "
+                  f"(cluster axis-ratio spread x{spread:.2f})")
 
             photo_cov = None
             if not args.no_photo_colors:
-                view_data = []
-                for vw in job["views"]:
-                    im = cv2.imread(os.path.join(images_dir, vw["frame"]))
-                    mk = np.load(os.path.join(masks_dir, os.path.splitext(vw["frame"])[0] + ".npz"))[vw["key"]]
-                    if im is None:
-                        continue
-                    if mk.shape != im.shape[:2]:
-                        mk = cv2.resize(mk.astype(np.uint8), (im.shape[1], im.shape[0]),
-                                        interpolation=cv2.INTER_NEAREST) > 0
-                    c2w_v, cam_v = poses[vw["frame"]]
-                    view_data.append({"rgb": cv2.cvtColor(im, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0,
-                                      "mask": mk.astype(bool), "c2w": c2w_v, "cam": cam_v})
+                view_data = [{"rgb": cv2.cvtColor(v["img"], cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0,
+                              "mask": v["mask"], "c2w": v["c2w"], "cam": v["cam"]} for v in vds]
                 C, photo_cov = photo_colors(pos + vs, F, C, view_data, float(size.max()))
                 print(f"  photo colours: {100 * photo_cov:.0f}% of vertices coloured from {len(view_data)} real view(s) "
                       f"(rest keep TripoSR's colour)")
@@ -807,11 +950,14 @@ def main():
             obj["replacement_has_vertex_colors"] = C is not None
             obj["replacement_align"] = {"iou": round(best["iou"], 3), "colour_diff": round(best["cdiff"], 3),
                                         "yaw_deg": round(best["yaw_deg"], 1), "scale": round(s, 5),
+                                        "scale_cluster": round(s_cluster, 5), "per_view_iou": per_view_iou,
+                                        "placement_offset": [round(float(x), 4) for x in t_fit],
+                                        "box_fit_error": None if fit_err is None else round(fit_err, 4),
                                         "scale_spread": round(spread, 3), "low_confidence": bool(low_conf),
                                         "crop_touches_border": bool(job["touches"]),
                                         "photo_color_coverage": None if photo_cov is None else round(photo_cov, 3),
-                                        "source_frame": bf,
-                                        "color_frames": [v["frame"] for v in job["views"]]}
+                                        "source_frame": vds[0]["frame"],
+                                        "color_frames": [v["frame"] for v in vds]}
             obj["world_up"] = [round(float(x), 5) for x in up]
             obj["replace_region"] = {"min": (pos + vs.min(0)).tolist(), "max": (pos + vs.max(0)).tolist()}
             print(f"  wrote {out_obj}")

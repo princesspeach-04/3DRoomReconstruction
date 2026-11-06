@@ -37,6 +37,11 @@ public class SceneObjectSpawner : MonoBehaviour
            + "(mesh_source = generative_replace_triposr). Untick to also spawn the plain "
            + "reconstructed object meshes (interactive/debug mode).")]
     public bool onlyReplacements = true;
+
+    [Header("Debug: mark regenerated parts")]
+    [Tooltip("Orange glow on every TripoSR-regenerated object so you can see what was replaced. Turn OFF for the exported asset.")]
+    public bool highlightReplacements = true;
+    public Color highlightColor = new Color(1f, 0.45f, 0f);
     public float minConfidence = 0f; // build_object_meshes.py's confidence is a GLOBAL average across
                                      // frames, not a real per-instance score -- don't set this too
                                      // strict, it won't discriminate between clusters meaningfully.
@@ -144,6 +149,19 @@ public class SceneObjectSpawner : MonoBehaviour
                         Debug.LogWarning("Shader 'Aerosense/VertexColorLit' not found -- add VertexColorLit.shader to the project. Using flat colour.");
                     mat = new Material(Shader.Find("Standard"));
                     mat.color = useVertexColors ? Color.white : classColor;
+                }
+                if (highlightReplacements && obj.mesh_source == "generative_replace_triposr")
+                {
+                    if (mat.HasProperty("_Highlight"))
+                    {
+                        mat.SetFloat("_Highlight", 1f);
+                        mat.SetColor("_HighlightColor", highlightColor);
+                    }
+                    else
+                    {
+                        mat.EnableKeyword("_EMISSION");
+                        mat.SetColor("_EmissionColor", highlightColor * 0.35f);
+                    }
                 }
                 mr.material = mat;
 
